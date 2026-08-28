@@ -10,62 +10,29 @@ cannot pass while the reader stops in the wrong place.
 import struct
 import unittest
 
+import helpers
 import ledger
+from helpers import (
+    DELETE,
+    OFF_FLAGS,
+    OFF_KEY_LEN,
+    OFF_MAGIC,
+    OFF_OP,
+    OFF_SEQ,
+    OFF_VAL_LEN,
+    OFF_VERSION,
+    PUT,
+    build_log,
+    flip_byte,
+    patch_header,
+)
 
-# Field offsets inside a record header, used to corrupt one field at a time.
-OFF_MAGIC = 0
-OFF_VERSION = 4
-OFF_OP = 5
-OFF_FLAGS = 6
-OFF_SEQ = 8
-OFF_KEY_LEN = 16
-OFF_VAL_LEN = 20
-OFF_PAYLOAD_CRC = 24
-OFF_HEADER_CRC = 28
-
-HDR = ledger.FILE_HEADER_SIZE
-REC = ledger.RECORD_HEADER_SIZE
-
-
-def build_log(records, generation=0):
-    """Build a log from ``(op, key, value)`` triples with sequential seqs."""
-    parts = [ledger.encode_file_header(generation)]
-    for index, (op, key, value) in enumerate(records, start=ledger.FIRST_SEQ):
-        parts.append(ledger.encode_record(op, index, key, value))
-    return b"".join(parts)
+HDR = helpers.SPEC_FILE_HEADER_SIZE
+REC = helpers.SPEC_RECORD_HEADER_SIZE
 
 
-def record_offsets(records):
-    """Start offset of each record, plus the offset just past the last."""
-    offsets = [HDR]
-    for _op, key, value in records:
-        offsets.append(offsets[-1] + REC + len(key) + len(value))
-    return offsets
-
-
-def rechecksum(header):
-    prefix = header[:OFF_HEADER_CRC]
-    return prefix + struct.pack("<I", ledger.crc32(prefix))
-
-
-def patch_header(log, offset, field, packed, fix_crc=True):
-    """Overwrite a header field, repairing the header CRC by default so the
-    field's own validation is what fires rather than the checksum."""
-    out = bytearray(log)
-    out[offset + field : offset + field + len(packed)] = packed
-    if fix_crc:
-        out[offset : offset + REC] = rechecksum(bytes(out[offset : offset + REC]))
-    return bytes(out)
-
-
-def flip_byte(log, offset):
-    out = bytearray(log)
-    out[offset] ^= 0xFF
-    return bytes(out)
-
-
-PUT = ledger.OP_PUT
-DELETE = ledger.OP_DELETE
+def record_offsets(history):
+    return helpers.boundaries(history)
 
 
 class ReportAssertions(unittest.TestCase):

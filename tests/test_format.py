@@ -9,12 +9,7 @@ than a silently different file.
 import unittest
 
 import ledger
-
-
-def flip_bit(data: bytes, byte_index: int, bit: int) -> bytes:
-    out = bytearray(data)
-    out[byte_index] ^= 1 << bit
-    return bytes(out)
+from helpers import flip_bit
 
 
 class TestConstants(unittest.TestCase):
