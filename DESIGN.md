@@ -186,6 +186,15 @@ that a compaction actually happened. Nothing in recovery depends on it.
 `sort_keys` makes the byte encoding of a given value deterministic, which
 matters for reproducible compaction output and for byte-exact tests.
 
+Values must be **interoperable JSON**. `json.dumps` is called with
+`allow_nan=False`, so `NaN`, `Infinity` and `-Infinity` are rejected at
+`put` with a `ValueError` rather than written out. Python's JSON module
+emits those three as bare `NaN`/`Infinity` tokens, which are not JSON and
+which other readers refuse. A store whose whole pitch is that the file can
+be inspected and recovered must not contain bytes that only Python can read
+back, so the restriction is deliberate: anything Ledger persists
+successfully is valid JSON.
+
 We chose JSON over `pickle` deliberately, and the tradeoff is real:
 
 - **For JSON:** unpickling a corrupted or attacker-supplied log is arbitrary
@@ -880,47 +889,86 @@ Supporting rules:
 ## 20. Crash-injection strategy
 
 The requirement is a *deterministic* crash test. Racing `SIGKILL` against a
-`write()` is not deterministic — the kernel usually completes the write, so the
-interesting torn-record case would appear rarely and unpredictably. We use a
-subprocess harness with two deterministic injection modes instead.
+`write()` is not deterministic — the kernel usually completes the write, so
+the interesting torn-record case would appear rarely and unpredictably. The
+harness is built on a subprocess and a pipe handshake instead. Nothing in it
+sleeps, polls for timing, or races a signal against a write.
 
 `tests/crash_child.py` is a standalone script, run by the parent with
-`subprocess.Popen`. It takes a store path and a scenario name and always ends
-by killing *itself* with `os.kill(os.getpid(), signal.SIGKILL)` — a real,
-uncatchable process death with no interpreter cleanup, no `finally` blocks, no
-buffer flushing, and no `atexit`.
+`subprocess.Popen`. It emits one line per event on stdout, blocks reading
+stdin until the parent acknowledges, and then kills *itself* with
+`os.kill(os.getpid(), signal.SIGKILL)` — a real, uncatchable process death
+with no interpreter cleanup, no `finally` blocks, no buffer flushing, and no
+`atexit`. The store is never closed and the lock is never released by us;
+the kernel does it.
 
-**Mode A — kill between commits.** The child opens the store, writes N records
-through the public API (each fsync'd), prints a line to stdout, and flushes
-after each. The parent reads exactly N lines — so it knows precisely which
-writes committed — and then the child `SIGKILL`s itself. The parent reopens the
-store in a fresh process and asserts all N records are present and the tail is
-`CLEAN`. Fully deterministic: the synchronisation is a pipe read, not a timer.
+```
+child                              parent
+-----                              ------
+open store
+put record 1  ──► COMMITTED 1 ───► read
+put record N  ──► COMMITTED N ───► read      (knows exactly what committed)
+              ──► READY       ───► read
+read stdin  ◄────────────────────  write "GO"
+SIGKILL self                       wait() → returncode must be -SIGKILL
+                                   reopen in a fresh process, verify
+```
 
-**Mode B — torn record.** The child commits N records normally, then
-deliberately appends the first *k* bytes of a well-formed record N+1 and
-immediately `SIGKILL`s itself. The parent reopens and asserts: the tail is
-detected as `TORN` at the right offset, the file is truncated to the boundary
-after record N, all N committed records are intact, and record N+1 is entirely
-absent. Sweeping *k* across header-boundary values (1, 16, 31, 32, 33,
-32+key_len, 32+key_len+val_len−1) covers every torn shape the format can
-produce.
+**Mode A — process interruption after committed records.** The child writes
+N records through the public API, announces each one, and dies. The parent
+reopens the store in a *fresh interpreter* (the script's own `verify`
+scenario) and checks that the recovered state is exactly the announced
+records, the log replays `CLEAN`, the sequence numbers are contiguous, and
+the writer lock is available again.
 
-Two properties of this harness matter:
+**Mode B — deterministic torn record.** The child commits N records, then
+appends only the first *K* bytes of a well-formed record N+1 straight to the
+file, and dies. *K* sweeps every shape the framing can be torn into: 1, 16
+and 31 bytes into the header; exactly 32 at the header boundary; 33, one
+byte into the payload; 32 + key length, at the key/value boundary; and one
+byte short of a complete record. A variant pads the fragment out to full
+record length with bytes the checksum does not cover, reproducing a torn
+write that landed in a reused disk block — complete-looking, but wrong —
+which is what exercises the `CORRUPT` path and the salvage file.
+
+Three properties of this harness matter:
 
 - **No test hooks in library code.** The seam lives entirely in the child
-  script, which writes the partial bytes itself. Nothing in `ledger.py` knows
-  tests exist — no `if os.environ.get("LEDGER_CRASH_AT")`, no injectable write
-  function, no monkeypatch surface. The shipped code path is the tested code
-  path.
-- **The on-disk shape is honest.** A power failure mid-write leaves a prefix of
-  a record at the end of the file. So does mode B. Recovery cannot tell the
-  difference, and that is the point. A variant appends `bytes[:k] + random
-  garbage` to reproduce the "torn write landing in a reused block" case, which
-  is what exercises the `CORRUPT` classification path.
+  script. Nothing in `ledger.py` knows tests exist — no
+  `if os.environ.get("LEDGER_CRASH_AT")`, no injectable write function, no
+  monkeypatch surface. The shipped code path is the tested code path.
+- **The on-disk shape is honest.** A power failure mid-write leaves a prefix
+  of a record at the end of the file. So does mode B. Recovery cannot tell
+  the difference, and that is the point. Writing the fragment directly is
+  not cheating around the writer: no writer would ever emit a partial
+  record, and the library has no code path that could be asked to.
+- **Expectations are computed independently.** The truncation boundary each
+  test asserts is derived from the committed records' own sizes, not from
+  the reader's answer, so a reader that stopped in the wrong place cannot
+  excuse itself.
 
-**The demo uses this exact harness**, not a scripted imitation of it — the
+**Safety.** Every child is killed on every exit path, including test
+failure. Reads are bounded by a watchdog that turns a hang into a failure
+carrying the child's command line, exit status and stderr. The watchdog is
+never how readiness is decided — that is always the handshake.
+
+**The demo uses this exact harness**, not a scripted imitation of it: the
 `SIGKILL` on screen is the same one in the test suite.
+
+### What the crash tests prove, per durability mode
+
+Mode A runs under both modes, and they are **not the same claim**:
+
+| Mode | What the test shows | What it does not show |
+| --- | --- | --- |
+| `strict` | Each `put` fsynced before returning, so the records were handed to the OS for stable media. Survival is the documented durability guarantee of §9. | Nothing beyond what the filesystem and device honour (§22). |
+| `relaxed` | The records survive `SIGKILL` because the bytes are in the kernel page cache, which outlives the killed process. **This is an observed process-interruption property of the tested filesystem and OS.** | It is **not** a power-loss guarantee, and must never be reported as one. A machine crash in this mode can lose acknowledged records. |
+
+The distinction is the difference between a property of Ledger and a
+property of the operating system. Ledger guarantees the recovery behaviour —
+that the valid record prefix is what comes back. Whether the bytes reached
+stable media before the power went out is the kernel's and the drive's
+business, and `relaxed` explicitly declines to ask.
 
 ## 21. Performance considerations
 
