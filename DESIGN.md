@@ -99,7 +99,7 @@ Signatures:
 
 ```python
 @classmethod
-def open(cls, path, *, mode="rw", durability="fsync", repair=True) -> "Ledger"
+def open(cls, path, *, mode="rw", durability="strict", repair=True) -> "Ledger"
 
 def put(self, key: str, value: JSONValue) -> None
 def get(self, key: str, default=None) -> JSONValue
@@ -118,10 +118,11 @@ def __contains__(self, key: str)
 
 - `mode`: `"rw"` (default) takes the writer lock and repairs the tail;
   `"r"` opens read-only, takes no lock, and never modifies the file.
-- `durability`: `"fsync"` (default) calls `os.fsync` before each mutating call
-  returns — survives process crash *and* power loss. `"os"` skips the fsync —
-  survives process crash only, because the bytes are in the OS page cache. §9
-  states exactly what each mode guarantees.
+- `durability`: `"strict"` (default) calls `os.fsync` before each mutating
+  call returns — survives process crash *and* power loss, subject to the
+  filesystem and hardware honouring fsync. `"relaxed"` skips the per-write
+  fsync — survives process crash only, because the bytes are already in the
+  OS page cache. §9 states exactly what each mode guarantees.
 - `repair`: `True` (default) truncates a damaged tail on open. `False` raises
   `CorruptLogError` instead, for an operator who wants to look first.
 
@@ -322,7 +323,7 @@ The write path for one `put` or `delete`:
    `bytes` object. CRCs are computed here.
 4. `os.write(fd, record)` in a single call, with the fd opened `O_APPEND`.
    Retry on short writes and on `EINTR`.
-5. If `durability == "fsync"`, `os.fsync(fd)`.
+5. If `durability == "strict"`, `os.fsync(fd)`.
 6. Update the in-memory index.
 7. Return.
 
@@ -361,10 +362,20 @@ grow the log.
 **A mutation is committed when the call returns normally.** Everything else
 follows from that sentence.
 
+Stated precisely, and deliberately no more strongly than this: **Ledger
+recovers the valid record prefix of the log after process interruption,
+subject to the documented filesystem durability semantics.** A single
+`os.write` is not a transaction and we never treat it as one — a crash can
+tear it at arbitrary byte granularity (§22). `fsync` does not make data
+physically indestructible; it asks the operating system to place the bytes
+on stable media, and its worth is bounded by whether the filesystem and the
+device honour that request (§22). What Ledger guarantees is the recovery
+behaviour, not the physics.
+
 | Durability mode | Survives `SIGKILL` / process crash | Survives OS crash or power loss |
 | --- | --- | --- |
-| `"fsync"` (default) | Yes | Yes, to the extent the hardware honours `fsync` (§22) |
-| `"os"` | Yes — bytes are in the kernel page cache, which outlives the process | No |
+| `"strict"` (default) | Yes | Yes, to the extent the filesystem and hardware honour `fsync` (§22) |
+| `"relaxed"` | Yes — bytes are in the kernel page cache, which outlives the process | No |
 
 Precise guarantees:
 
@@ -428,7 +439,10 @@ open(path, mode, repair):
        i. offset += 32 + key_len + val_len
           last_good = offset; expected_seq += 1
   7. if tail != CLEAN:
-       if not repair or mode == "r": raise CorruptLogError(report)
+       if mode == "r":
+            if tail == TORN: accept the valid prefix, change nothing on disk
+            else: raise CorruptLogError(report)
+       elif not repair: raise CorruptLogError(report)
        if tail == CORRUPT: copy bytes[last_good:EOF] to <path>.salvage.<n>
        ftruncate(fd, last_good); fsync(fd); fsync(parent directory)
   8. next_seq = expected_seq; write_offset = last_good; store is open
@@ -456,7 +470,7 @@ of the last fully-validated record. Every acknowledged record therefore lies
 entirely before `last_good`, because acknowledgement (§9) required its bytes to
 be written, in order, before any later byte existed. Truncation can only
 discard bytes belonging to a record that never returned to a caller. The one
-exception is the honest one: in `durability="os"` mode, a machine crash can
+exception is the honest one: in `durability="relaxed"` mode, a machine crash can
 lose acknowledged records that were still in the page cache — which is what
 that mode means.
 
@@ -488,9 +502,20 @@ bytes are preserved verbatim for offline analysis before the file is shortened.
 They are never read back automatically. They may contain application data, and
 therefore inherit the store's `0600` permissions (§23).
 
-With `repair=False`, or in read-only mode, no truncation happens at all:
-`CorruptLogError` is raised carrying the full report (offset, reason, valid
-record count, bytes that would be discarded), and the file is left untouched.
+With `repair=False`, no truncation happens at all: `CorruptLogError` is
+raised carrying the full report (offset, reason, valid record count, bytes
+that would be discarded), and the file is left untouched.
+
+**Read-only mode treats the two tails differently, and must.** A reader
+running concurrently with a writer will routinely catch a record mid-write
+and see a `TORN` tail; that is the normal case §15 describes, not damage, so
+a read-only open accepts the valid prefix and reports the snapshot it found.
+Raising there would make concurrent reads fail at random — §10 and §15
+contradicted each other on this point, and this is the resolution. A
+`CORRUPT` tail is genuine damage, so a read-only open raises
+`CorruptLogError` rather than silently serving a prefix of a file it knows
+is broken. Neither path writes to the file. The `repair` flag is therefore
+meaningful only in write mode.
 
 ## 12. Delete semantics
 
@@ -909,7 +934,7 @@ Cost model:
 | Operation | Cost |
 | --- | --- |
 | `put` / `delete` | 1 `write()` + 1 `fsync()`. **The fsync dominates by orders of magnitude** — roughly tens of microseconds on NVMe, single-digit milliseconds on spinning rust. Everything else (JSON encode, two CRCs, `struct.pack`) is noise beside it. |
-| `put` with `durability="os"` | 1 `write()`, no fsync. Bounded by memcpy into the page cache. |
+| `put` with `durability="relaxed"` | 1 `write()`, no fsync. Bounded by memcpy into the page cache. |
 | `get` | dict lookup + one `json.loads`. No I/O, no syscall. |
 | `scan` | `sorted()` over the key set + lazy decode per yielded item. |
 | `open` | one sequential pass over the whole file: O(bytes on disk). This is the number that matters for startup, and it is why compaction exists. |
@@ -919,8 +944,8 @@ Cost model:
 Consequences we accept, and would fix in this order if we had reason:
 
 1. Every mutation fsyncs. That is the durability the product is named for. The
-   documented escape hatch is `durability="os"` for callers who genuinely do
-   not need power-loss safety.
+   documented escape hatch is `durability="relaxed"` for callers who genuinely
+   do not need power-loss safety.
 2. Log growth is unbounded until `compact()`. Overwrites and deletes leave dead
    bytes; `inspect` reports the ratio so the application can decide.
 3. Startup is linear in file size, not in live-key count. A store that is

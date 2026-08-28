@@ -26,6 +26,10 @@ and of a single record:
 
 from __future__ import annotations
 
+import fcntl
+import json
+import os
+import pathlib
 import struct
 import zlib
 from dataclasses import dataclass
@@ -45,6 +49,12 @@ __all__ = [
     "split_payload",
     "LogReport",
     "replay_log",
+    "Ledger",
+    "CorruptLogError",
+    "LockedError",
+    "ReadOnlyError",
+    "ClosedError",
+    "WriteError",
 ]
 
 # --------------------------------------------------------------------------
@@ -528,3 +538,423 @@ def replay_log(data: bytes, apply=None) -> LogReport:
         tail_state=tail_state,
         tail_reason=tail_reason,
     )
+
+
+# --------------------------------------------------------------------------
+# Engine
+# --------------------------------------------------------------------------
+
+MODE_READ_WRITE = "rw"
+MODE_READ = "r"
+
+# Durability policies.  These are the only two; see DESIGN.md section 9 for
+# exactly what each survives.
+DURABILITY_STRICT = "strict"
+DURABILITY_RELAXED = "relaxed"
+
+_LOCK_SUFFIX = ".lock"
+_SALVAGE_SUFFIX = ".salvage."
+
+# Owner-only: local application state is nobody else's business (DESIGN.md
+# section 23).
+_FILE_MODE = 0o600
+
+
+class CorruptLogError(LedgerError):
+    """The log ends in damage that was not repaired.
+
+    Carries the ``LogReport`` describing exactly what was found.
+    """
+
+    def __init__(self, message: str, report: "LogReport") -> None:
+        super().__init__(message)
+        self.report = report
+
+
+class LockedError(LedgerError):
+    """Another process holds the writer lock on this store."""
+
+
+class ReadOnlyError(LedgerError):
+    """A mutation was attempted on a handle opened read-only."""
+
+
+class ClosedError(LedgerError):
+    """The handle has been closed."""
+
+
+class WriteError(LedgerError):
+    """A write or fsync failed; the handle is poisoned.
+
+    The log may now end in a partial record.  Close the handle and reopen:
+    recovery is the one path that repairs a torn tail (DESIGN.md section 8).
+    """
+
+
+def _fsync_directory(path) -> None:
+    """Make a file's creation or truncation durable, not just its contents.
+
+    Renaming and creating are directory operations, so fsync on the file
+    alone does not persist them (DESIGN.md section 22).
+    """
+    fd = os.open(path.parent or ".", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _acquire_writer_lock(lock_path):
+    """Take the exclusive advisory lock on the sidecar.
+
+    The lock lives beside the data file rather than on it because compaction
+    replaces the data file's inode, and a lock held on the old inode would
+    silently stop excluding anyone (DESIGN.md section 16).
+    """
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, _FILE_MODE)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(fd)
+        raise LockedError(
+            f"another process holds the writer lock on {lock_path}"
+        ) from error
+    return fd
+
+
+def _save_salvage(path, discarded: bytes) -> "str | None":
+    """Preserve bytes about to be discarded from a corrupt tail.
+
+    A corrupt tail is truncated, but never silently: the bytes are copied
+    aside first so they can be examined (DESIGN.md section 11).
+    """
+    for index in range(1000):
+        candidate = path.parent / (path.name + _SALVAGE_SUFFIX + str(index))
+        try:
+            fd = os.open(
+                candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE
+            )
+        except FileExistsError:
+            continue
+        try:
+            os.write(fd, discarded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return str(candidate)
+    return None
+
+
+class Ledger:
+    """A crash-safe embedded key/value store.
+
+    Open one with :meth:`open`; the constructor is internal.
+
+        db = Ledger.open("state.ledger")
+        db.put("user:42", {"name": "Venu"})
+        db.get("user:42")
+
+    Keys are non-empty strings.  Values are anything ``json.dumps`` accepts,
+    which means the usual JSON round-trip caveats apply: tuples come back as
+    lists, non-string dict keys come back as strings, and sets, bytes and
+    datetimes are rejected outright rather than silently mangled.
+    """
+
+    def __init__(self, path, fd, lock_fd, mode, durability, index, next_seq, report):
+        self._path = path
+        self._fd = fd
+        self._lock_fd = lock_fd
+        self._mode = mode
+        self._durability = durability
+        # key -> the exact JSON payload bytes for that key.  Storing encoded
+        # bytes rather than decoded objects is deliberate: it makes it
+        # impossible for a caller mutating a returned object to change the
+        # store's idea of its own state (DESIGN.md section 13).
+        self._index = index
+        self._next_seq = next_seq
+        self._report = report
+        self._closed = False
+        self._poisoned = None
+
+    # -- lifecycle --------------------------------------------------------
+
+    @classmethod
+    def open(cls, path, *, mode=MODE_READ_WRITE, durability=DURABILITY_STRICT,
+             repair=True):
+        """Open a store, recovering it if the log ends in a damaged tail.
+
+        ``mode`` is ``"rw"`` (default; takes the writer lock and repairs a
+        damaged tail) or ``"r"`` (takes no lock and never writes to the
+        file).  ``durability`` is ``"strict"`` or ``"relaxed"``.  ``repair``
+        applies to write mode only: with ``False`` a damaged tail raises
+        ``CorruptLogError`` instead of being truncated.
+        """
+        if mode not in (MODE_READ_WRITE, MODE_READ):
+            raise ValueError(f"mode must be 'rw' or 'r', got {mode!r}")
+        if durability not in (DURABILITY_STRICT, DURABILITY_RELAXED):
+            raise ValueError(
+                f"durability must be 'strict' or 'relaxed', got {durability!r}"
+            )
+
+        path = pathlib.Path(path)
+        writable = mode == MODE_READ_WRITE
+        lock_fd = None
+        fd = None
+        try:
+            # The lock is taken before the file is created or read.  Doing it
+            # the other way round would let two processes race to initialise
+            # the same store, each believing it created it.
+            if writable:
+                lock_fd = _acquire_writer_lock(
+                    path.parent / (path.name + _LOCK_SUFFIX)
+                )
+                flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC
+            else:
+                flags = os.O_RDONLY | os.O_CLOEXEC
+            fd = os.open(path, flags, _FILE_MODE)
+
+            created = writable and os.fstat(fd).st_size == 0
+            if created:
+                os.write(fd, encode_file_header(0))
+                os.fsync(fd)
+                _fsync_directory(path)
+
+            with open(path, "rb") as handle:
+                data = handle.read()
+
+            index = {}
+
+            def apply(offset, header, key, value):
+                name = key.decode("utf-8")
+                if header.op == OP_PUT:
+                    index[name] = value
+                else:
+                    index.pop(name, None)
+
+            report = replay_log(data, apply=apply)
+            if report.repair_required:
+                cls._handle_damaged_tail(path, fd, data, report, mode, repair)
+
+            return cls(
+                path=path,
+                fd=fd,
+                lock_fd=lock_fd,
+                mode=mode,
+                durability=durability,
+                index=index,
+                next_seq=report.last_valid_seq + 1,
+                report=report,
+            )
+        except BaseException:
+            # Never leave the lock held by a handle that was never returned.
+            if fd is not None:
+                os.close(fd)
+            if lock_fd is not None:
+                os.close(lock_fd)
+            raise
+
+    @staticmethod
+    def _handle_damaged_tail(path, fd, data, report, mode, repair):
+        message = (
+            f"{path}: log ends {report.tail_state} ({report.tail_reason}) at "
+            f"offset {report.valid_end_offset}; "
+            f"{report.discarded_bytes} bytes after the last valid record"
+        )
+        if mode == MODE_READ:
+            # A reader racing a writer routinely sees a torn tail; that is a
+            # snapshot, not damage, and read-only handles never write.
+            if report.tail_state == TAIL_TORN:
+                return
+            raise CorruptLogError(message, report)
+        if not repair:
+            raise CorruptLogError(message, report)
+
+        if report.tail_state == TAIL_CORRUPT:
+            _save_salvage(path, data[report.valid_end_offset :])
+        os.ftruncate(fd, report.valid_end_offset)
+        os.fsync(fd)
+        _fsync_directory(path)
+
+    def close(self) -> None:
+        """Release the file and the lock.  Idempotent, and never a commit
+        point: every mutation committed when its call returned."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            os.close(self._fd)
+        finally:
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+    # -- guards -----------------------------------------------------------
+
+    def _check_usable(self) -> None:
+        if self._closed:
+            raise ClosedError(f"{self._path}: handle is closed")
+        if self._poisoned is not None:
+            raise WriteError(
+                f"{self._path}: handle is poisoned by an earlier failed write "
+                f"({self._poisoned}); close and reopen to recover"
+            )
+
+    def _check_writable(self) -> None:
+        self._check_usable()
+        if self._mode != MODE_READ_WRITE:
+            raise ReadOnlyError(f"{self._path}: handle is read-only")
+
+    # -- write path -------------------------------------------------------
+
+    def _append(self, op, key_bytes, value_bytes) -> None:
+        """Encode, append, make durable, and only then return.
+
+        The caller updates the index after this returns, never before, so
+        the in-memory state can never claim something the log does not hold.
+        """
+        record = encode_record(op, self._next_seq, key_bytes, value_bytes)
+        try:
+            written = 0
+            while written < len(record):
+                written += os.write(self._fd, record[written:])
+            if self._durability == DURABILITY_STRICT:
+                os.fsync(self._fd)
+        except OSError as error:
+            # The log may now end in a partial record.  Refuse to touch this
+            # handle again rather than appending after unknown bytes; the
+            # next open repairs the tail through the ordinary recovery path.
+            self._poisoned = error
+            raise WriteError(f"{self._path}: append failed: {error}") from error
+        self._next_seq += 1
+
+    # -- operations -------------------------------------------------------
+
+    def put(self, key, value) -> None:
+        """Store ``value`` under ``key``.  Durable when this returns."""
+        self._check_writable()
+        key_bytes = _encode_key(key)
+        value_bytes = _encode_value(value)
+        self._append(OP_PUT, key_bytes, value_bytes)
+        self._index[key] = value_bytes
+
+    def get(self, key, default=None):
+        """Return the value stored under ``key``, or ``default``.
+
+        The returned object is decoded fresh on every call, so mutating it
+        cannot affect the store.
+        """
+        self._check_usable()
+        if not isinstance(key, str):
+            raise TypeError(f"key must be str, got {type(key).__name__}")
+        payload = self._index.get(key)
+        if payload is None:
+            return default
+        return json.loads(payload)
+
+    def delete(self, key) -> bool:
+        """Delete ``key``, returning True if it existed.
+
+        Deleting an absent key writes nothing, so repeated deletes cannot
+        grow the log.
+        """
+        self._check_writable()
+        key_bytes = _encode_key(key)
+        if key not in self._index:
+            return False
+        self._append(OP_DELETE, key_bytes, b"")
+        del self._index[key]
+        return True
+
+    def scan(self, prefix: str = ""):
+        """Yield ``(key, value)`` pairs in key order, optionally filtered.
+
+        The set of keys is snapshotted when ``scan`` is called; values are
+        decoded lazily as they are yielded, so a prefix scan does not decode
+        the whole store.
+        """
+        self._check_usable()
+        if not isinstance(prefix, str):
+            raise TypeError(f"prefix must be str, got {type(prefix).__name__}")
+        snapshot = [
+            (key, payload)
+            for key, payload in sorted(self._index.items())
+            if key.startswith(prefix)
+        ]
+        for key, payload in snapshot:
+            yield key, json.loads(payload)
+
+    # -- introspection ----------------------------------------------------
+
+    def __len__(self) -> int:
+        self._check_usable()
+        return len(self._index)
+
+    def __contains__(self, key) -> bool:
+        self._check_usable()
+        return isinstance(key, str) and key in self._index
+
+    @property
+    def path(self):
+        return self._path
+
+    @property
+    def durability(self) -> str:
+        return self._durability
+
+    @property
+    def recovery_report(self) -> LogReport:
+        """The report produced when this handle was opened."""
+        return self._report
+
+    def __repr__(self) -> str:
+        state = "closed" if self._closed else (
+            "poisoned" if self._poisoned is not None else self._mode
+        )
+        return f"<Ledger {str(self._path)!r} {state} keys={len(self._index)}>"
+
+
+def _encode_key(key) -> bytes:
+    if not isinstance(key, str):
+        raise TypeError(f"key must be str, got {type(key).__name__}")
+    encoded = key.encode("utf-8")
+    if not encoded:
+        raise ValueError("key must not be empty")
+    if len(encoded) > MAX_KEY_BYTES:
+        raise ValueError(
+            f"key is {len(encoded)} bytes, over the {MAX_KEY_BYTES} byte limit"
+        )
+    return encoded
+
+
+def _encode_value(value) -> bytes:
+    """Serialize a value to its canonical JSON bytes.
+
+    ``sort_keys`` makes the encoding of a given value deterministic, which
+    keeps compaction output and test fixtures byte-stable.  ``allow_nan`` is
+    off because NaN and Infinity are not JSON and other readers reject them.
+    """
+    try:
+        text = json.dumps(
+            value,
+            separators=(",", ":"),
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except ValueError as error:
+        raise ValueError(f"value is not representable as JSON: {error}") from error
+    except TypeError as error:
+        raise TypeError(f"value is not JSON-encodable: {error}") from error
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_VALUE_BYTES:
+        raise ValueError(
+            f"value encodes to {len(encoded)} bytes, over the "
+            f"{MAX_VALUE_BYTES} byte limit"
+        )
+    return encoded
