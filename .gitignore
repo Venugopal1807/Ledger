@@ -1,0 +1,14 @@
+# Bytecode: embeds absolute paths and interpreter magic numbers, which would
+# break the reproducible build (DESIGN.md section 24).
+__pycache__/
+*.py[cod]
+
+# Build output. The published digest lives in dist/SHA256SUMS.
+/dist/
+!/dist/SHA256SUMS
+
+# Ledger stores and their sidecars, in case one is created while testing.
+*.ledger
+*.ledger.lock
+*.ledger.compact
+*.ledger.salvage.*
