@@ -55,6 +55,8 @@ __all__ = [
     "ReadOnlyError",
     "ClosedError",
     "WriteError",
+    "CompactionError",
+    "CompactionResult",
 ]
 
 # --------------------------------------------------------------------------
@@ -554,6 +556,12 @@ DURABILITY_RELAXED = "relaxed"
 
 _LOCK_SUFFIX = ".lock"
 _SALVAGE_SUFFIX = ".salvage."
+_COMPACT_SUFFIX = ".compact"
+
+# Records are buffered into chunks of roughly this size while a compacted
+# log is written, so a large store costs a few dozen writes rather than one
+# per record.
+_COMPACT_CHUNK_BYTES = 64 * 1024
 
 # Owner-only: local application state is nobody else's business (DESIGN.md
 # section 23).
@@ -583,12 +591,35 @@ class ClosedError(LedgerError):
     """The handle has been closed."""
 
 
+class CompactionError(LedgerError):
+    """Compaction failed before it replaced anything.
+
+    The original log is untouched and still authoritative, and the handle
+    remains usable: nothing was lost and no state changed.
+    """
+
+
 class WriteError(LedgerError):
     """A write or fsync failed; the handle is poisoned.
 
     The log may now end in a partial record.  Close the handle and reopen:
     recovery is the one path that repairs a torn tail (DESIGN.md section 8).
     """
+
+
+def _write_all(fd, data) -> None:
+    """Write every byte, tolerating a short write from the kernel."""
+    written = 0
+    while written < len(data):
+        written += os.write(fd, data[written:])
+
+
+def _remove_quietly(path) -> None:
+    """Delete a file that may not exist, without caring if it does not."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def _fsync_directory(path) -> None:
@@ -645,6 +676,21 @@ def _save_salvage(path, discarded: bytes) -> "str | None":
     return None
 
 
+@dataclass(frozen=True)
+class CompactionResult:
+    """What one compaction did."""
+
+    records_before: int
+    records_after: int
+    bytes_before: int
+    bytes_after: int
+    generation: int
+
+    @property
+    def bytes_reclaimed(self) -> int:
+        return self.bytes_before - self.bytes_after
+
+
 class Ledger:
     """A crash-safe embedded key/value store.
 
@@ -672,6 +718,8 @@ class Ledger:
         # store's idea of its own state (DESIGN.md section 13).
         self._index = index
         self._next_seq = next_seq
+        self._generation = report.generation
+        self._records = report.valid_records
         self._report = report
         self._closed = False
         self._poisoned = None
@@ -708,6 +756,12 @@ class Ledger:
                 lock_fd = _acquire_writer_lock(
                     path.parent / (path.name + _LOCK_SUFFIX)
                 )
+                # A leftover temp file is the debris of a compaction that
+                # died before its atomic replace. It is never authoritative
+                # and is never resumed: resuming would mean trusting a file
+                # whose writer stopped at an unknown point, which is the one
+                # thing this design refuses to do anywhere.
+                _remove_quietly(path.parent / (path.name + _COMPACT_SUFFIX))
                 flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC
             else:
                 flags = os.O_RDONLY | os.O_CLOEXEC
@@ -820,9 +874,7 @@ class Ledger:
         """
         record = encode_record(op, self._next_seq, key_bytes, value_bytes)
         try:
-            written = 0
-            while written < len(record):
-                written += os.write(self._fd, record[written:])
+            _write_all(self._fd, record)
             if self._durability == DURABILITY_STRICT:
                 os.fsync(self._fd)
         except OSError as error:
@@ -832,6 +884,7 @@ class Ledger:
             self._poisoned = error
             raise WriteError(f"{self._path}: append failed: {error}") from error
         self._next_seq += 1
+        self._records += 1
 
     # -- operations -------------------------------------------------------
 
@@ -870,6 +923,160 @@ class Ledger:
         self._append(OP_DELETE, key_bytes, b"")
         del self._index[key]
         return True
+
+    def compact(self):
+        """Rewrite the log holding only what is needed to reconstruct the
+        current state, and atomically replace the old one.
+
+        Every live key is emitted once, as a PUT carrying the exact value
+        bytes already in the index.  Deleted keys are emitted as nothing at
+        all: a tombstone exists only to shadow an earlier record for the
+        same key, and once no earlier record survives in the file there is
+        nothing left for it to shadow, so dropping the pair is what makes a
+        delete actually reclaim space.
+
+        Sequence numbers restart at 1.  This is not a preference, it is
+        required: ``seq`` is a within-file framing invariant checked for
+        strict +1 continuity by recovery (DESIGN.md sections 5 and 10).
+        Compaction drops records, so preserving the original numbers would
+        leave gaps, and a gap is precisely what recovery classifies as
+        corruption.  A fresh basis per file generation keeps the invariant
+        intact.  The file header's ``generation`` counter is what survives
+        compaction, and it is diagnostic only.
+
+        The original log is never rewritten in place and never truncated.
+        The new one is built beside it, validated, fsynced and only then
+        swapped in, so a crash at any point leaves either the whole old log
+        or the whole new one.
+        """
+        self._check_writable()
+        temp_path = self._path.parent / (self._path.name + _COMPACT_SUFFIX)
+        bytes_before = os.fstat(self._fd).st_size
+        records_before = self._records
+        generation = (self._generation + 1) & 0xFFFFFFFF
+
+        # Sorted so the output is deterministic: the same live state always
+        # compacts to byte-identical output.
+        live = sorted(self._index.items())
+
+        try:
+            self._write_compacted(temp_path, live, generation)
+            self._verify_compacted(temp_path)
+        except BaseException as error:
+            _remove_quietly(temp_path)
+            if isinstance(error, (OSError, CompactionError)):
+                raise CompactionError(
+                    f"{self._path}: compaction failed, original log is "
+                    f"unchanged and still authoritative: {error}"
+                ) from error
+            raise
+
+        try:
+            # The temp file is in the same directory as the log because
+            # os.replace is only atomic within one filesystem; a temp file
+            # elsewhere could land on another mount and degrade to a
+            # copy-then-delete with a window where neither file is whole.
+            os.replace(temp_path, self._path)
+        except OSError as error:
+            _remove_quietly(temp_path)
+            raise CompactionError(
+                f"{self._path}: atomic replace failed, original log is "
+                f"unchanged and still authoritative: {error}"
+            ) from error
+
+        # Past this line the new file is the authoritative log. The rename
+        # itself is a directory operation, so fsyncing the file would not
+        # persist it; the directory must be fsynced instead. If this fails
+        # the store is still coherent - the path names one complete log or
+        # the other - but the rename may not survive a power cut.
+        _fsync_directory(self._path)
+
+        try:
+            old_fd = self._fd
+            self._fd = os.open(
+                self._path, os.O_RDWR | os.O_APPEND | os.O_CLOEXEC
+            )
+            os.close(old_fd)
+        except OSError as error:
+            self._poisoned = error
+            raise WriteError(
+                f"{self._path}: compaction completed but the log could not "
+                f"be reopened: {error}"
+            ) from error
+
+        self._generation = generation
+        self._records = len(live)
+        self._next_seq = len(live) + FIRST_SEQ
+        return CompactionResult(
+            records_before=records_before,
+            records_after=len(live),
+            bytes_before=bytes_before,
+            bytes_after=os.fstat(self._fd).st_size,
+            generation=generation,
+        )
+
+    def _write_compacted(self, temp_path, live, generation) -> None:
+        """Build the replacement log beside the original and fsync it."""
+        # Any leftover temp file is debris from an interrupted compaction,
+        # so remove it first; O_EXCL then guarantees we are writing into a
+        # file nobody else created.
+        _remove_quietly(temp_path)
+        fd = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            _FILE_MODE,
+        )
+        try:
+            buffer = bytearray(encode_file_header(generation))
+            seq = FIRST_SEQ
+            for key, value_bytes in live:
+                # The value bytes are copied straight out of the index, so
+                # compaction never re-encodes a value and cannot change one.
+                buffer += encode_record(
+                    OP_PUT, seq, key.encode("utf-8"), value_bytes
+                )
+                seq += 1
+                if len(buffer) >= _COMPACT_CHUNK_BYTES:
+                    _write_all(fd, buffer)
+                    buffer.clear()
+            if buffer:
+                _write_all(fd, buffer)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _verify_compacted(self, temp_path) -> None:
+        """Replay the replacement before trusting it.
+
+        Reads the file back and checks that it reconstructs exactly the
+        current index.  Counting matches rather than building a second
+        dictionary keeps this from doubling the store's memory.
+        """
+        with open(temp_path, "rb") as handle:
+            data = handle.read()
+
+        verified = 0
+
+        def check(offset, header, key, value):
+            nonlocal verified
+            name = key.decode("utf-8")
+            if header.op != OP_PUT or self._index.get(name) != value:
+                raise CompactionError(
+                    f"compacted log disagrees with the index at key {name!r}"
+                )
+            verified += 1
+
+        report = replay_log(data, apply=check)
+        if report.tail_state != TAIL_CLEAN:
+            raise CompactionError(
+                f"compacted log does not replay clean: {report.tail_state} "
+                f"({report.tail_reason})"
+            )
+        if verified != len(self._index):
+            raise CompactionError(
+                f"compacted log holds {verified} records, "
+                f"expected {len(self._index)}"
+            )
 
     def scan(self, prefix: str = ""):
         """Yield ``(key, value)`` pairs in key order, optionally filtered.
