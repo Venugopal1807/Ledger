@@ -220,7 +220,7 @@ Header, little-endian, `struct` format `<4sBBHQIIII`, 32 bytes total:
 | 6 | 2 | `flags` | `0`; any other value is invalid |
 | 8 | 8 | `seq` | u64, starts at 1, exactly +1 per record in this file |
 | 16 | 4 | `key_len` | u32, `1 <= key_len <= 4096` |
-| 20 | 4 | `val_len` | u32, `<= 8 MiB`; must be `0` when `op == DELETE` |
+| 20 | 4 | `val_len` | u32. `0` when `op == DELETE`; `1 <= val_len <= 8 MiB` when `op == PUT` |
 | 24 | 4 | `payload_crc` | `zlib.crc32(key_bytes + value_bytes)` |
 | 28 | 4 | `header_crc` | `zlib.crc32(header_bytes[0:28])` |
 
@@ -231,7 +231,7 @@ Every field earns its place against a specific failure mode:
 | Wrong file / garbage at this offset | `magic`, `header_crc` |
 | Format drift after an upgrade | `version`, `format_version` |
 | Invalid operation | `op` range check |
-| Invalid / absurd lengths | `key_len`, `val_len` range checks, checked **after** `header_crc` |
+| Invalid / absurd lengths | `key_len`, `val_len` range checks, checked **after** `header_crc`; reported as the distinct diagnostics `invalid_key_len` and `invalid_val_len` |
 | Bit rot in the header itself | `header_crc` |
 | Bit rot in key or value | `payload_crc` |
 | Incomplete write (torn record) | short read against `key_len + val_len` |
@@ -246,6 +246,12 @@ header has been verified.
 
 DELETE records carry the key and no value (`val_len == 0`). They are
 tombstones, not header-only markers, because the key is what recovery needs.
+
+Conversely a PUT record must carry at least one value byte. A serialized
+JSON value is never empty — the shortest possible encoding is a single
+character such as `0` — so `op == PUT` with `val_len == 0` is a shape we can
+never legitimately write, and rejecting it costs nothing. It is one more
+free corruption check, reported as `invalid_val_len`.
 
 ## 6. Record framing
 
@@ -408,8 +414,8 @@ open(path, mode, repair):
             1..31 bytes        -> tail = TORN (short_header), break
        b. verify header_crc    -> mismatch: tail = CORRUPT (header_crc), break
        c. verify magic, version, op in {PUT, DELETE}, flags == 0,
-          1 <= key_len <= 4096, val_len <= 8 MiB,
-          val_len == 0 if op == DELETE
+          1 <= key_len <= 4096,
+          val_len == 0 if op == DELETE else 1 <= val_len <= 8 MiB
                               -> failure: tail = CORRUPT (<specific reason>), break
        d. verify seq == expected_seq
                               -> mismatch: tail = CORRUPT (seq_gap), break
@@ -739,8 +745,21 @@ LedgerError(Exception)              base; catch this to catch everything
 ├── LockedError                     another process holds the writer lock
 ├── ReadOnlyError                   mutation attempted on a mode="r" handle
 ├── ClosedError                     operation on a closed handle
-└── WriteError                      write/fsync failed; handle is poisoned (§8)
+├── WriteError                      write/fsync failed; handle is poisoned (§8)
+└── CorruptRecordError              internal (format/recovery layer only) — see below
 ```
+
+**`CorruptRecordError` is internal.** The format layer raises it when a
+record's bytes are complete but fail validation, carrying a `reason` code
+(the `REASON_*` constants) that names precisely which invariant broke. It
+exists because the recovery reader needs to classify damage, not merely
+report it, and an exception message is not an API for that.
+
+It does not escape the public API. The recovery reader catches it, records
+the reason in the `LogReport`, and the engine converts a refused repair into
+the public `CorruptLogError`, which carries the same report. Application
+code catches `CorruptLogError`; only the format and recovery layers — and
+their tests — refer to `CorruptRecordError`.
 
 Rules:
 
@@ -748,6 +767,13 @@ Rules:
   Every failure that is *about the caller's arguments* raises the standard
   built-in: `TypeError` for a non-`str` key or a non-JSON-encodable value,
   `ValueError` for an empty key or an oversize key/value.
+- **Encoding a bad argument and decoding bad bytes raise different types,
+  even for the identical record shape.** The encode and decode paths share
+  one validator so a record can never be written in a shape the reader would
+  reject, but a caller passing a zero-length key is a bug in the caller
+  (`ValueError`), while reading a header whose `key_len` is zero is damage on
+  disk (`CorruptRecordError`). Collapsing the two would mean reporting a
+  programming error as data corruption, or worse, the reverse.
 - `get` never raises `KeyError`; a missing key returns `default`. Absence is
   not exceptional in a state store.
 - `CorruptLogError` and `inspect()` share one report object, so the
@@ -1046,11 +1072,25 @@ Test and build tooling may additionally use `unittest`, `tempfile`,
    review finding. (A pinned fallback list covers Python 3.9, where
    `sys.stdlib_module_names` does not exist.)
 2. **Isolated interpreter run** — the suite also runs under
-   `python3 -I -S -m unittest discover -s tests`. `-S` disables `site`, so
-   `site-packages` is not on `sys.path` at all, and `-I` ignores user site and
-   `PYTHONPATH`. If anything third-party were reachable, this run fails. This
-   is the strongest of the three: it does not inspect the code, it removes the
-   possibility.
+
+   ```
+   python3 -E -s -S -m unittest discover -s tests
+   ```
+
+   This is the project's isolated-environment verification command. `-S`
+   disables `site`, so `site-packages` is not on `sys.path` at all; `-E`
+   ignores `PYTHONPATH`; `-s` ignores the user site directory. If anything
+   third-party were reachable, this run fails. It is the strongest of the
+   three proofs: it does not inspect the code, it removes the possibility.
+
+   **Not `-I`.** Isolated mode would be the obvious choice, but on Python
+   3.11+ `-I` also implies `-P`, which stops the current directory being
+   prepended to `sys.path`. Since Ledger is imported from the repository
+   root rather than installed, `import ledger` fails under `-I` before a
+   single test runs, and no implementation change can fix that — the flag
+   removes the import path the project is loaded from. `-E -s -S` provides
+   the same isolation guarantees against `PYTHONPATH`, user site-packages
+   and `site-packages` without disabling the local import.
 3. **Import inventory** — `python3 tools/depcheck.py` prints every imported
    module with its resolved origin, so the claim can be read rather than
    trusted. Its output is pasted verbatim into the dependency-proof section of

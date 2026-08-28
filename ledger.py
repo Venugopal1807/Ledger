@@ -43,6 +43,8 @@ __all__ = [
     "decode_record_header",
     "verify_payload",
     "split_payload",
+    "LogReport",
+    "replay_log",
 ]
 
 # --------------------------------------------------------------------------
@@ -359,3 +361,170 @@ def split_payload(header: RecordHeader, payload: bytes) -> tuple[bytes, bytes]:
             f"payload must be {header.payload_len} bytes, got {len(payload)}"
         )
     return payload[: header.key_len], payload[header.key_len :]
+
+
+# --------------------------------------------------------------------------
+# Recovery reader
+# --------------------------------------------------------------------------
+
+# Terminal state of a log scan.  These classify how the file ended, not
+# whether the data in it is useful.
+TAIL_CLEAN = "clean"
+TAIL_TORN = "torn"
+TAIL_CORRUPT = "corrupt"
+
+# Reasons the format layer cannot produce, because they are visible only
+# while scanning a sequence of records rather than one set of bytes.
+REASON_SHORT_HEADER = "short_header"
+REASON_SHORT_PAYLOAD = "short_payload"
+REASON_SEQ_GAP = "seq_gap"
+REASON_SEQ_REGRESSION = "seq_regression"
+REASON_SEQ_DUPLICATE = "seq_duplicate"
+
+# Every reason a scan can stop on, grouped by the classification it implies.
+TORN_REASONS = frozenset({REASON_SHORT_HEADER, REASON_SHORT_PAYLOAD})
+CORRUPT_REASONS = frozenset(
+    {
+        REASON_BAD_MAGIC,
+        REASON_BAD_VERSION,
+        REASON_HEADER_CRC,
+        REASON_INVALID_OP,
+        REASON_INVALID_FLAGS,
+        REASON_INVALID_KEY_LEN,
+        REASON_INVALID_VAL_LEN,
+        REASON_PAYLOAD_CRC,
+        REASON_SEQ_GAP,
+        REASON_SEQ_REGRESSION,
+        REASON_SEQ_DUPLICATE,
+    }
+)
+
+
+@dataclass(frozen=True)
+class LogReport:
+    """The result of replaying a log: what was valid, and how it ended.
+
+    This is the structured answer the engine, the future inspect command,
+    the tests and the demo all read.  Classification is carried in
+    ``tail_state`` and ``tail_reason`` as explicit constants; exception
+    messages are never the API for it.
+    """
+
+    generation: int
+    file_size: int
+    valid_records: int
+    last_valid_seq: int
+    last_valid_offset: "int | None"
+    valid_end_offset: int
+    tail_state: str
+    tail_reason: "str | None"
+
+    @property
+    def repair_required(self) -> bool:
+        """True if the file ends in anything other than a record boundary.
+
+        When this is True, ``valid_end_offset`` is the offset to truncate
+        to.  Whether the truncation actually happens is the engine's policy
+        (write mode, and the ``repair`` flag), not a property of the log.
+        """
+        return self.tail_state != TAIL_CLEAN
+
+    @property
+    def discarded_bytes(self) -> int:
+        """Bytes after the last valid record; zero for a clean log."""
+        return self.file_size - self.valid_end_offset
+
+
+def replay_log(data: bytes, apply=None) -> LogReport:
+    """Replay a log from its file header forward, stopping at the first
+    record that is incomplete or fails validation.
+
+    ``apply`` is called as ``apply(offset, header, key, value)`` for each
+    valid record, in sequence order.  Passing ``None`` validates without
+    materialising anything, which is what a read-only diagnosis wants.
+
+    Recovery is deliberately conservative: once a record fails, the scan
+    stops.  It does not search forward for the next plausible record.  After
+    a damaged region we cannot distinguish a genuine later record from stale
+    bytes left in a reused block, and the sequence continuity that would
+    otherwise tell us apart is exactly what has been broken.  Resurrecting
+    data we cannot place in history is how a store silently returns a value
+    that was overwritten long ago.  Forensic scanning past the damage is a
+    job for inspect, where a human makes the call.
+
+    Raises ``FormatError`` if the file header is missing or unreadable; a
+    store whose header we cannot trust has no valid prefix to recover.
+    """
+    file_header = decode_file_header(data[:FILE_HEADER_SIZE])
+
+    file_size = len(data)
+    offset = FILE_HEADER_SIZE
+    expected_seq = FIRST_SEQ
+    previous_seq = 0
+    valid_records = 0
+    last_valid_offset = None
+    last_valid_seq = 0
+    tail_state = TAIL_CLEAN
+    tail_reason = None
+
+    while True:
+        if offset == file_size:
+            break
+
+        header_bytes = data[offset : offset + RECORD_HEADER_SIZE]
+        if len(header_bytes) < RECORD_HEADER_SIZE:
+            tail_state, tail_reason = TAIL_TORN, REASON_SHORT_HEADER
+            break
+
+        try:
+            # This validates the checksum before any other field, so the
+            # length fields below are already known to be in range.
+            header = decode_record_header(header_bytes)
+        except CorruptRecordError as error:
+            tail_state, tail_reason = TAIL_CORRUPT, error.reason
+            break
+
+        if header.seq != expected_seq:
+            if valid_records and header.seq == previous_seq:
+                reason = REASON_SEQ_DUPLICATE
+            elif header.seq > expected_seq:
+                reason = REASON_SEQ_GAP
+            else:
+                reason = REASON_SEQ_REGRESSION
+            tail_state, tail_reason = TAIL_CORRUPT, reason
+            break
+
+        payload_start = offset + RECORD_HEADER_SIZE
+        payload_end = payload_start + header.payload_len
+        if payload_end > file_size:
+            tail_state, tail_reason = TAIL_TORN, REASON_SHORT_PAYLOAD
+            break
+
+        payload = data[payload_start:payload_end]
+        try:
+            verify_payload(header, payload)
+        except CorruptRecordError as error:
+            tail_state, tail_reason = TAIL_CORRUPT, error.reason
+            break
+
+        if apply is not None:
+            key, value = split_payload(header, payload)
+            apply(offset, header, key, value)
+
+        valid_records += 1
+        last_valid_offset = offset
+        last_valid_seq = header.seq
+        previous_seq = header.seq
+        expected_seq = header.seq + 1
+        offset = payload_end
+
+    return LogReport(
+        generation=file_header.generation,
+        file_size=file_size,
+        valid_records=valid_records,
+        last_valid_seq=last_valid_seq,
+        last_valid_offset=last_valid_offset,
+        valid_end_offset=offset,
+        tail_state=tail_state,
+        tail_reason=tail_reason,
+    )
