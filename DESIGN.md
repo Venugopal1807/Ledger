@@ -620,15 +620,68 @@ live key is absent from both files. The old inode is unlinked by `os.replace`;
 any reader holding it open keeps reading a valid older snapshot until it
 reopens (§15).
 
+Measured across all nine crash points, the survivor flips exactly at
+`os.replace` and nowhere else — the six points before it recover the original
+log, the three after it recover the compacted one, and nothing else is ever
+observed. **The rename is a single kernel operation, so userspace cannot see a
+moment part-way through it.** "During the replace" is therefore not a state we
+can test, and we do not pretend otherwise: we test both observable sides and
+treat the absence of anything between them as the guarantee it is.
+
+If any step before the replace fails, the temp file is removed and
+`CompactionError` is raised. The original log is untouched and still
+authoritative, and — unlike a failed append (§8) — the handle is *not*
+poisoned, because nothing changed. If the directory fsync after the replace
+fails, the store is still coherent (the path names one complete log or the
+other); only the durability of the rename is in question.
+
+Peak memory during compaction scales with **live** data, not log size: the old
+log is never materialised. Measured, an 11.5 MB log holding 3.8 MB of live data
+peaked at 3.9 MB.
+
 The `.compact` temp file is **never** authoritative. It is deleted, not
 resumed, on the next open. Resuming a partial compaction would mean trusting a
 file whose writer died at an unknown point — the one thing we refuse to do
 anywhere else in this design.
 
-Sequence numbers restart at 1 in the new file. `seq` is a *within-file* framing
-invariant (§5), not a global logical clock, and nothing outside a single file's
-recovery pass depends on it. `generation` in the file header is the counter that
-survives compaction, and it is diagnostic only.
+**Sequence numbers restart at 1 in the new file, and this is forced rather than
+chosen.** Recovery checks strict `+1` continuity and classifies any deviation
+as corruption (§5, §10). Compaction drops records, so preserving the original
+numbers would leave gaps — and a gap is exactly what recovery would, correctly,
+refuse. A fresh basis per file generation keeps the invariant intact.
+
+Stated explicitly, so none of it is left implicit:
+
+- **Which live keys are emitted:** every key in the index, once, as a PUT
+  carrying the exact value bytes already held there. Compaction never
+  re-encodes a value and therefore cannot change one.
+- **Why deleted keys are not emitted:** a tombstone exists only to shadow an
+  earlier record for the same key. Once no earlier record survives in the file
+  it has nothing left to shadow, and emitting the pair would defeat the point —
+  a delete that never reclaims space is not a delete.
+- **Sequence basis:** new. The compacted file is numbered `1..N` for its `N`
+  live keys, in sorted key order.
+- **Next mutation:** `N + 1`, continuing the new file's basis.
+- **How recovery validates it:** identically to any other log. A compacted file
+  is not a special case; it is an ordinary log that happens to contain no
+  obsolete records, and §10 reads it with the same single forward pass.
+
+`generation` in the file header is the counter that survives compaction, and it
+is diagnostic only — nothing in recovery depends on it. It is what the crash
+tests use to identify which log won a race.
+
+**The replacement is validated before it is trusted.** Once the temp file is
+written and fsynced it is replayed back and checked against the live index:
+every record must be a PUT whose value bytes match, the count must match, and
+the log must replay `CLEAN`. Only then is `os.replace` called. The check counts
+matches rather than building a second dictionary, so it does not double the
+store's memory.
+
+**The temp file lives in the same directory as the log, deliberately.**
+`os.replace` is atomic only within a single filesystem. A temp file in `/tmp`,
+or anywhere else that might be a different mount, would silently degrade the
+rename into a copy-then-delete with a window in which neither file is whole —
+the exact failure this design exists to prevent.
 
 Compaction is explicit — `db.compact()` or `ledger compact FILE`. There is no
 automatic trigger, no background thread, and no threshold to tune. `inspect`
@@ -780,6 +833,7 @@ LedgerError(Exception)              base; catch this to catch everything
 ├── ReadOnlyError                   mutation attempted on a mode="r" handle
 ├── ClosedError                     operation on a closed handle
 ├── WriteError                      write/fsync failed; handle is poisoned (§8)
+├── CompactionError                 compaction failed before replacing anything (§14)
 └── CorruptRecordError              internal (format/recovery layer only) — see below
 ```
 
