@@ -447,6 +447,181 @@ class TestTornRecord(CrashTestCase):
         self.assertEqual(report.valid_records, 2)
 
 
+class TestCompactionCrashes(CrashTestCase):
+    """Crash at each named point in the compaction state machine.
+
+    The property under test, at every point, is the same: reopening finds
+    EITHER the whole original log OR the whole compacted one. Never half of
+    each, never missing state, never a resurrected deleted key, never a
+    malformed authoritative log.
+
+    On the atomicity of os.replace: the rename is a single kernel operation
+    and userspace cannot observe a moment part-way through it, so
+    "immediately around replacement" is not two states we can catch. We
+    test the two sides that are observable - before-replace and
+    after-replace - and treat the absence of anything in between as the
+    guarantee it is, rather than pretending to a resolution we do not have.
+    """
+
+    RECORDS = 6
+    ROUNDS = 4
+    DELETED = (2, 5)
+
+    def expected_state(self, value_bytes=16):
+        """What the store must hold, computed from the child's own history
+        rather than from whatever recovery happens to produce."""
+        return {
+            crash_child.record_key(index): {
+                "n": index,
+                "round": self.ROUNDS - 1,
+                "pad": "x" * value_bytes,
+            }
+            for index in range(1, self.RECORDS + 1)
+            if index not in self.DELETED
+        }
+
+    def crash_during_compaction(self, point, value_bytes=16, records=None,
+                                rounds=None):
+        records = records or self.RECORDS
+        rounds = rounds or self.ROUNDS
+        with self.child(
+            "compact-then-kill", "--at", point,
+            "--records", str(records), "--rounds", str(rounds),
+            "--value-bytes", str(value_bytes),
+        ) as child:
+            for _ in range(records - len(self.DELETED)):
+                child.expect("COMMITTED")
+            child.expect("ARMED")
+            child.release()
+            child.expect_killed()
+
+    def assert_coherent_after_crash(self, expected):
+        """Whichever log survived, it must be whole and mean exactly the
+        expected logical state.
+
+        Which log survived is not asserted here, because either answer is
+        correct - that is the guarantee. It is identified through the
+        generation counter: 0 is the original, still carrying its obsolete
+        history, and 1 is the compacted replacement.
+        """
+        state = self.verify_in_fresh_process()
+        self.assertEqual(state["entries"], expected, "logical state changed")
+        self.assertFalse(
+            os.path.exists(self.path + ".compact"),
+            "a stale temp file must be removed on open",
+        )
+        report = ledger.replay_log(self.read_file())
+        self.assertEqual(report.tail_state, ledger.TAIL_CLEAN, "log not whole")
+        self.assertEqual(
+            report.last_valid_seq, report.valid_records, "sequence not contiguous"
+        )
+        self.assertIn(report.generation, (0, 1))
+        if report.generation == 1:
+            # The compacted log won, so it holds one record per live key.
+            self.assertEqual(report.valid_records, len(expected))
+        else:
+            # The original won, so it still carries the obsolete history it
+            # always had - proof it was never rewritten in place.
+            self.assertGreaterEqual(report.valid_records, len(expected))
+        return report
+
+    def test_every_compaction_crash_point(self):
+        for point in crash_child.COMPACT_CRASH_POINTS:
+            with self.subTest(point=point):
+                self.setUp()
+                # during-temp-write needs enough live data for the compacted
+                # output to span several buffered writes.
+                big = point == "during-temp-write"
+                value_bytes = 30000 if big else 16
+                records = 8 if big else self.RECORDS
+                self.crash_during_compaction(
+                    point, value_bytes=value_bytes, records=records
+                )
+                expected = {
+                    crash_child.record_key(index): {
+                        "n": index,
+                        "round": self.ROUNDS - 1,
+                        "pad": "x" * value_bytes,
+                    }
+                    for index in range(1, records + 1)
+                    if index not in self.DELETED
+                }
+                self.assert_coherent_after_crash(expected)
+
+    def test_crash_before_replace_keeps_the_original_log(self):
+        self.crash_during_compaction("before-replace")
+        report = self.assert_coherent_after_crash(self.expected_state())
+        # The original log still carries its obsolete history, so it was
+        # never truncated or rewritten in place.
+        self.assertEqual(report.generation, 0)
+
+    def test_crash_after_replace_keeps_the_compacted_log(self):
+        self.crash_during_compaction("after-replace")
+        report = self.assert_coherent_after_crash(self.expected_state())
+        self.assertEqual(report.generation, 1, "compacted log not in place")
+        self.assertEqual(report.valid_records, self.RECORDS - len(self.DELETED))
+
+    def test_partially_written_temp_file_is_discarded(self):
+        self.crash_during_compaction(
+            "during-temp-write", value_bytes=30000, records=8
+        )
+        expected = {
+            crash_child.record_key(index): {
+                "n": index, "round": self.ROUNDS - 1, "pad": "x" * 30000,
+            }
+            for index in range(1, 9) if index not in self.DELETED
+        }
+        report = self.assert_coherent_after_crash(expected)
+        self.assertEqual(report.generation, 0, "half-written temp was adopted")
+
+    def test_deleted_keys_are_never_resurrected_by_a_crash(self):
+        for point in crash_child.COMPACT_CRASH_POINTS:
+            with self.subTest(point=point):
+                self.setUp()
+                big = point == "during-temp-write"
+                self.crash_during_compaction(
+                    point,
+                    value_bytes=30000 if big else 16,
+                    records=8 if big else self.RECORDS,
+                )
+                state = self.verify_in_fresh_process()
+                for index in self.DELETED:
+                    self.assertNotIn(
+                        crash_child.record_key(index), state["entries"]
+                    )
+
+    def test_store_is_writable_after_a_compaction_crash(self):
+        self.crash_during_compaction("before-dir-fsync")
+        expected = self.expected_state()
+        db = ledger.Ledger.open(self.path)
+        self.addCleanup(db.close)
+        db.put("after:crash", {"ok": True})
+        db.close()
+        report = ledger.replay_log(self.read_file())
+        self.assertEqual(report.tail_state, ledger.TAIL_CLEAN)
+        self.assertEqual(report.last_valid_seq, report.valid_records)
+        final = self.verify_in_fresh_process()["entries"]
+        self.assertEqual(final.pop("after:crash"), {"ok": True})
+        self.assertEqual(final, expected)
+
+    def test_compaction_can_be_retried_after_a_crash(self):
+        self.crash_during_compaction("before-replace")
+        expected = self.expected_state()
+        db = ledger.Ledger.open(self.path)
+        self.addCleanup(db.close)
+        result = db.compact()
+        self.assertEqual(dict(db.scan()), expected)
+        self.assertEqual(result.records_after, len(expected))
+        db.close()
+        self.assertEqual(self.verify_in_fresh_process()["entries"], expected)
+
+    def test_killed_compactor_releases_its_lock(self):
+        self.crash_during_compaction("after-temp-fsync")
+        db = ledger.Ledger.open(self.path)
+        self.addCleanup(db.close)
+        self.assertEqual(dict(db.scan()), self.expected_state())
+
+
 class TestHarnessSafety(CrashTestCase):
     def test_child_reports_sigkill_exit_status(self):
         with self.child("commit-then-kill", "--records", "1") as child:

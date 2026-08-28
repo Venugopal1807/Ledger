@@ -12,12 +12,14 @@ acknowledges, then kills itself.  Nothing depends on timing.
 
     python3 tests/crash_child.py PATH commit-then-kill --records 5
     python3 tests/crash_child.py PATH torn-record --records 3 --keep 20
+    python3 tests/crash_child.py PATH compact-then-kill --at before-replace
     python3 tests/crash_child.py PATH verify
 
 Protocol, one line at a time on stdout, each flushed:
 
     COMMITTED <seq> <key>    one per record the store accepted
     TORN <kept> <total>      bytes of a partial record appended to the file
+    ARMED <point>            a compaction crash point is armed
     READY <detail>           everything is done; waiting for the parent
     <parent writes "GO">     the child then raises SIGKILL on itself
 
@@ -29,6 +31,7 @@ import argparse
 import json
 import os
 import signal
+import stat
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -159,6 +162,143 @@ def scenario_verify(args):
     emit("STATE " + json.dumps(state, sort_keys=True))
 
 
+# ---------------------------------------------------------------------------
+# Compaction crash points
+# ---------------------------------------------------------------------------
+#
+# The crash points are armed by wrapping os functions *in this child
+# process*.  ledger.py is untouched and has no idea a test exists: it calls
+# os.open, os.write, os.fsync and os.replace exactly as it always does, and
+# this script decides that one of those calls is the last thing the process
+# will ever do.  Patching the syscall layer in a throwaway process is not
+# the same as putting a hook in the library.
+
+COMPACT_CRASH_POINTS = (
+    "before-temp-create",     # 1. temp file does not exist yet
+    "after-temp-create",      # 2. temp file exists, empty
+    "during-temp-write",      # 3. temp file partially written
+    "before-temp-fsync",      # 4. temp fully written, not yet durable
+    "after-temp-fsync",       # 5. temp complete and durable
+    "before-replace",         # 6. old log still authoritative
+    "after-replace",          # 7. new log authoritative, rename maybe not durable
+    "before-dir-fsync",       # 8. same instant, named from the other side
+    "after-dir-fsync",        # 9. fully committed
+)
+
+
+def _is_directory(fd):
+    return stat.S_ISDIR(os.fstat(fd).st_mode)
+
+
+def arm_compaction_crash(point, temp_suffix=".compact"):
+    """Wrap the os calls compaction makes so one of them kills us.
+
+    Nothing here is timing based.  Each point is a specific, named position
+    in the compaction state machine, reached deterministically.
+    """
+    if point not in COMPACT_CRASH_POINTS:
+        raise SystemExit(f"unknown crash point {point!r}")
+
+    real_open, real_write = os.open, os.write
+    real_fsync, real_replace = os.fsync, os.replace
+    real_close = os.close
+    temp_fds = set()
+    writes = {"count": 0}
+
+    def patched_open(path, flags, mode=0o777, **kwargs):
+        is_temp = str(path).endswith(temp_suffix)
+        if is_temp and point == "before-temp-create":
+            die_now()
+        fd = real_open(path, flags, mode, **kwargs)
+        if is_temp:
+            temp_fds.add(fd)
+            if point == "after-temp-create":
+                die_now()
+        return fd
+
+    def patched_write(fd, data):
+        if fd in temp_fds:
+            writes["count"] += 1
+            # Die on the second chunk, so the temp file is left genuinely
+            # half written rather than empty.
+            if point == "during-temp-write" and writes["count"] == 2:
+                die_now()
+        return real_write(fd, data)
+
+    def patched_close(fd):
+        # Descriptor numbers are recycled the moment they are closed, so a
+        # closed temp fd must leave the set or the next open - the parent
+        # directory, as it happens - inherits its identity.
+        temp_fds.discard(fd)
+        return real_close(fd)
+
+    def patched_fsync(fd):
+        # Ask what the descriptor actually is before trusting bookkeeping:
+        # a directory is never the temp file, whatever the numbers say.
+        if _is_directory(fd):
+            if point == "before-dir-fsync":
+                die_now()
+            result = real_fsync(fd)
+            if point == "after-dir-fsync":
+                die_now()
+            return result
+        if fd in temp_fds:
+            if point == "before-temp-fsync":
+                die_now()
+            result = real_fsync(fd)
+            if point == "after-temp-fsync":
+                die_now()
+            return result
+        return real_fsync(fd)
+
+    def patched_replace(src, dst, **kwargs):
+        if point == "before-replace":
+            die_now()
+        result = real_replace(src, dst, **kwargs)
+        if point == "after-replace":
+            die_now()
+        return result
+
+    os.open, os.write, os.fsync, os.replace, os.close = (
+        patched_open, patched_write, patched_fsync, patched_replace,
+        patched_close,
+    )
+
+
+def scenario_compact_then_kill(args):
+    """Write a history with obsolete records, then die inside compaction.
+
+    Whichever point is armed, reopening must find either the whole original
+    log or the whole compacted one - never a mixture, never missing state,
+    never a resurrected deleted key.
+    """
+    db = ledger.Ledger.open(args.path, durability=args.durability)
+    for round_number in range(args.rounds):
+        for index in range(1, args.records + 1):
+            db.put(record_key(index), {
+                "n": index,
+                "round": round_number,
+                "pad": "x" * args.value_bytes,
+            })
+    for index in args.delete:
+        db.delete(record_key(index))
+    for index in range(1, args.records + 1):
+        key = record_key(index)
+        if index not in args.delete:
+            emit(f"COMMITTED {index} {key}")
+
+    # The during-temp-write point needs the compacted output to span more
+    # than one buffered write. That is driven by how much live data there
+    # is (--value-bytes), never by reaching into Ledger's internals.
+    arm_compaction_crash(args.at)
+    emit(f"ARMED {args.at}")
+    wait_for_parent()
+    db.compact()
+    # Only reachable if the armed point was never hit, which is a bug in
+    # the harness rather than in Ledger.
+    raise SystemExit(f"crash point {args.at!r} was never reached")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path")
@@ -183,6 +323,19 @@ def main(argv=None):
         default=ledger.DURABILITY_STRICT,
     )
     torn.set_defaults(run=scenario_torn_record)
+
+    compact = subparsers.add_parser("compact-then-kill")
+    compact.add_argument("--records", type=int, default=6)
+    compact.add_argument("--rounds", type=int, default=4)
+    compact.add_argument("--delete", type=int, nargs="*", default=[2, 5])
+    compact.add_argument("--value-bytes", type=int, default=16)
+    compact.add_argument("--at", required=True, choices=COMPACT_CRASH_POINTS)
+    compact.add_argument(
+        "--durability",
+        choices=(ledger.DURABILITY_STRICT, ledger.DURABILITY_RELAXED),
+        default=ledger.DURABILITY_STRICT,
+    )
+    compact.set_defaults(run=scenario_compact_then_kill)
 
     verify = subparsers.add_parser("verify")
     verify.add_argument("--mode", choices=("rw", "r"), default="rw")
