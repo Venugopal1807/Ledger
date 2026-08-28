@@ -11,11 +11,13 @@ child announces what it has done, then blocks reading stdin until the parent
 acknowledges, then kills itself.  Nothing depends on timing.
 
     python3 tests/crash_child.py PATH commit-then-kill --records 5
+    python3 tests/crash_child.py PATH torn-record --records 3 --keep 20
     python3 tests/crash_child.py PATH verify
 
 Protocol, one line at a time on stdout, each flushed:
 
     COMMITTED <seq> <key>    one per record the store accepted
+    TORN <kept> <total>      bytes of a partial record appended to the file
     READY <detail>           everything is done; waiting for the parent
     <parent writes "GO">     the child then raises SIGKILL on itself
 
@@ -80,6 +82,60 @@ def scenario_commit_then_kill(args):
     die_now()
 
 
+# The partial record Mode B appends.  Fixed so the parent can compute the
+# interesting truncation points (32 + key length, total - 1) without having
+# to parse anything back out of the file.
+TORN_KEY = b"torn:key"
+TORN_VALUE = b'{"v":999}'
+TORN_RECORD_SIZE = ledger.RECORD_HEADER_SIZE + len(TORN_KEY) + len(TORN_VALUE)
+
+
+def scenario_torn_record(args):
+    """Mode B: commit N records, then append a partial record and die.
+
+    A power failure part-way through a write leaves a prefix of a record at
+    the end of the file.  Appending the first K bytes ourselves produces
+    exactly that on-disk shape, deterministically, at a byte offset we
+    choose - rather than racing a signal against a write() the kernel will
+    usually finish anyway.
+
+    The bytes go straight to the file rather than through Ledger, because
+    that is the point: no writer would ever emit a partial record, and the
+    library has no code path that could be asked to.  The store is left
+    open and unrepaired.
+    """
+    db = ledger.Ledger.open(args.path, durability=args.durability)
+    for index in range(1, args.records + 1):
+        key = record_key(index)
+        db.put(key, record_value(index))
+        emit(f"COMMITTED {index} {key}")
+
+    with open(args.path, "rb") as handle:
+        next_seq = ledger.replay_log(handle.read()).last_valid_seq + 1
+    record = ledger.encode_record(ledger.OP_PUT, next_seq, TORN_KEY, TORN_VALUE)
+    if not 1 <= args.keep <= len(record):
+        raise SystemExit(f"--keep must be 1..{len(record)}, got {args.keep}")
+
+    fragment = record[: args.keep]
+    if args.garbage:
+        # Fill the record out to its full length with bytes that are not the
+        # ones the checksum covers, which is how a torn write landing in a
+        # reused disk block presents: complete-looking, but wrong.
+        fragment += b"\xa5" * (len(record) - args.keep)
+
+    fd = os.open(args.path, os.O_WRONLY | os.O_APPEND)
+    try:
+        os.write(fd, fragment)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    emit(f"TORN {len(fragment)} {len(record)}")
+    emit(f"READY committed={args.records} keep={args.keep} garbage={args.garbage}")
+    wait_for_parent()
+    die_now()
+
+
 def scenario_verify(args):
     """Open the store in this fresh process and report what it holds.
 
@@ -116,6 +172,17 @@ def main(argv=None):
         default=ledger.DURABILITY_STRICT,
     )
     kill.set_defaults(run=scenario_commit_then_kill)
+
+    torn = subparsers.add_parser("torn-record")
+    torn.add_argument("--records", type=int, default=3)
+    torn.add_argument("--keep", type=int, required=True)
+    torn.add_argument("--garbage", action="store_true")
+    torn.add_argument(
+        "--durability",
+        choices=(ledger.DURABILITY_STRICT, ledger.DURABILITY_RELAXED),
+        default=ledger.DURABILITY_STRICT,
+    )
+    torn.set_defaults(run=scenario_torn_record)
 
     verify = subparsers.add_parser("verify")
     verify.add_argument("--mode", choices=("rw", "r"), default="rw")

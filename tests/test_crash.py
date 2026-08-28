@@ -276,6 +276,177 @@ class TestProcessInterruption(CrashTestCase):
         self.assertEqual(state["tail_state"], ledger.TAIL_CLEAN)
 
 
+class TestTornRecord(CrashTestCase):
+    """Mode B: a partial record at the end of the file, written
+    deterministically at a chosen byte offset, then SIGKILL."""
+
+    RECORDS = 3
+
+    # Every shape the framing can be torn into: inside the header at its
+    # start, middle and last byte; exactly at the header boundary; one byte
+    # into the payload; at the key/value boundary; and one byte short of a
+    # complete record.
+    KEEP_VALUES = (
+        1, 16, 31, 32, 33,
+        ledger.RECORD_HEADER_SIZE + len(crash_child.TORN_KEY),
+        crash_child.TORN_RECORD_SIZE - 1,
+    )
+
+    def tear_after_commits(self, keep, garbage=False):
+        args = ["torn-record", "--records", str(self.RECORDS), "--keep", str(keep)]
+        if garbage:
+            args.append("--garbage")
+        with self.child(*args) as child:
+            keys = [child.expect("COMMITTED").split()[2]
+                    for _ in range(self.RECORDS)]
+            appended = int(child.expect("TORN").split()[1])
+            child.expect("READY")
+            child.release()
+            child.expect_killed()
+        return keys, appended
+
+    def committed_end_offset(self):
+        """Where the log should be truncated back to: computed from the
+        committed records, not from the reader's own answer."""
+        offset = ledger.FILE_HEADER_SIZE
+        for index in range(1, self.RECORDS + 1):
+            key = crash_child.record_key(index).encode()
+            value = json.dumps(
+                crash_child.record_value(index),
+                separators=(",", ":"), sort_keys=True, ensure_ascii=False,
+            ).encode()
+            offset += ledger.RECORD_HEADER_SIZE + len(key) + len(value)
+        return offset
+
+    def test_torn_tail_at_every_meaningful_offset(self):
+        for keep in self.KEEP_VALUES:
+            with self.subTest(keep=keep):
+                self.setUp()
+                keys, appended = self.tear_after_commits(keep)
+                self.assertEqual(appended, keep)
+                boundary = self.committed_end_offset()
+                size_before = os.path.getsize(self.path)
+                self.assertEqual(size_before, boundary + keep)
+
+                # The reader must see a torn tail before anything repairs it.
+                report = ledger.replay_log(self.read_file())
+                self.assertEqual(report.tail_state, ledger.TAIL_TORN)
+                self.assertEqual(report.valid_records, self.RECORDS)
+                self.assertEqual(report.valid_end_offset, boundary)
+                expected_reason = (
+                    ledger.REASON_SHORT_HEADER
+                    if keep < ledger.RECORD_HEADER_SIZE
+                    else ledger.REASON_SHORT_PAYLOAD
+                )
+                self.assertEqual(report.tail_reason, expected_reason)
+
+                # Opening repairs it automatically.
+                state = self.verify_in_fresh_process()
+                self.assertEqual(sorted(state["entries"]), sorted(keys))
+                self.assertNotIn(
+                    crash_child.TORN_KEY.decode(), state["entries"],
+                    "the partial record must never become visible",
+                )
+                self.assertEqual(os.path.getsize(self.path), boundary)
+
+                # And the repaired log replays clean.
+                after = ledger.replay_log(self.read_file())
+                self.assertEqual(after.tail_state, ledger.TAIL_CLEAN)
+                self.assertEqual(after.valid_records, self.RECORDS)
+
+    def test_torn_header_and_torn_payload_are_distinguished(self):
+        self.tear_after_commits(16)
+        self.assertEqual(
+            ledger.replay_log(self.read_file()).tail_reason,
+            ledger.REASON_SHORT_HEADER,
+        )
+        self.setUp()
+        self.tear_after_commits(40)
+        self.assertEqual(
+            ledger.replay_log(self.read_file()).tail_reason,
+            ledger.REASON_SHORT_PAYLOAD,
+        )
+
+    def test_sequence_continues_correctly_after_repair(self):
+        self.tear_after_commits(20)
+        db = ledger.Ledger.open(self.path)
+        self.assertEqual(db.recovery_report.tail_state, ledger.TAIL_TORN)
+        db.put("after:repair", {"ok": True})
+        db.close()
+        report = ledger.replay_log(self.read_file())
+        self.assertEqual(report.tail_state, ledger.TAIL_CLEAN)
+        self.assertEqual(report.valid_records, self.RECORDS + 1)
+        # The partial record consumed a sequence number that was never
+        # committed, so the next record reuses it rather than skipping.
+        self.assertEqual(report.last_valid_seq, self.RECORDS + 1)
+
+    def test_repeated_reopen_after_repair_is_stable(self):
+        self.tear_after_commits(20)
+        first = self.verify_in_fresh_process()
+        sizes = [os.path.getsize(self.path)]
+        for _ in range(3):
+            state = self.verify_in_fresh_process()
+            self.assertEqual(state["entries"], first["entries"])
+            self.assertEqual(state["tail_state"], ledger.TAIL_CLEAN)
+            self.assertFalse(state["repair_required"])
+            sizes.append(os.path.getsize(self.path))
+        self.assertEqual(len(set(sizes)), 1, "repair is not idempotent on disk")
+
+    def test_partial_record_is_not_resurrected_by_later_writes(self):
+        self.tear_after_commits(40)
+        db = ledger.Ledger.open(self.path)
+        db.put("later", 1)
+        db.close()
+        seen = []
+        ledger.replay_log(
+            self.read_file(),
+            apply=lambda offset, header, key, value: seen.append(key.decode()),
+        )
+        self.assertNotIn(crash_child.TORN_KEY.decode(), seen)
+        self.assertEqual(seen[-1], "later")
+
+    def test_torn_region_with_garbage_is_classified_corrupt(self):
+        for keep in (1, 16, 32, 40):
+            with self.subTest(keep=keep):
+                self.setUp()
+                keys, appended = self.tear_after_commits(keep, garbage=True)
+                self.assertEqual(appended, crash_child.TORN_RECORD_SIZE)
+                report = ledger.replay_log(self.read_file())
+                self.assertEqual(report.tail_state, ledger.TAIL_CORRUPT)
+                self.assertEqual(report.valid_records, self.RECORDS)
+                self.assertEqual(
+                    report.valid_end_offset, self.committed_end_offset()
+                )
+                expected_reason = (
+                    ledger.REASON_HEADER_CRC
+                    if keep < ledger.RECORD_HEADER_SIZE
+                    else ledger.REASON_PAYLOAD_CRC
+                )
+                self.assertEqual(report.tail_reason, expected_reason)
+
+                state = self.verify_in_fresh_process()
+                self.assertEqual(sorted(state["entries"]), sorted(keys))
+                salvaged = [n for n in os.listdir(self.dir) if ".salvage." in n]
+                self.assertEqual(
+                    len(salvaged), 1, "a corrupt tail must be preserved"
+                )
+
+    def test_torn_tail_under_relaxed_durability(self):
+        with self.child(
+            "torn-record", "--records", "2", "--keep", "20",
+            "--durability", ledger.DURABILITY_RELAXED,
+        ) as child:
+            for _ in range(2):
+                child.expect("COMMITTED")
+            child.expect("TORN")
+            child.expect("READY")
+            child.release()
+            child.expect_killed()
+        report = ledger.replay_log(self.read_file())
+        self.assertEqual(report.tail_state, ledger.TAIL_TORN)
+        self.assertEqual(report.valid_records, 2)
+
+
 class TestHarnessSafety(CrashTestCase):
     def test_child_reports_sigkill_exit_status(self):
         with self.child("commit-then-kill", "--records", "1") as child:
