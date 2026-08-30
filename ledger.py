@@ -1358,6 +1358,18 @@ def _cmd_inspect(args):
     return EXIT_OK
 
 
+def _cmd_compact(args):
+    if not os.path.exists(args.file):
+        raise FileNotFoundError(args.file)
+    with Ledger.open(args.file) as db:
+        result = db.compact()
+    print(f"records: {result.records_before} -> {result.records_after}")
+    print(f"size:    {_human_bytes(result.bytes_before)} -> "
+          f"{_human_bytes(result.bytes_after)}")
+    print("status:  compacted")
+    return EXIT_OK
+
+
 def _build_parser():
     parser = _Parser(
         prog="ledger",
@@ -1391,6 +1403,12 @@ def _build_parser():
     )
     inspect.add_argument("file")
     inspect.set_defaults(run=_cmd_inspect)
+
+    compact = commands.add_parser(
+        "compact", help="rewrite the log without obsolete records"
+    )
+    compact.add_argument("file")
+    compact.set_defaults(run=_cmd_compact)
 
     return parser
 

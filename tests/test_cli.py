@@ -515,6 +515,129 @@ class TestForensicScan(CliTestCase):
         self.assertEqual(self.read_file(), data, "scanning mutated the data")
 
 
+class TestCompact(CliTestCase):
+    def build_wasteful_store(self):
+        """A history with obsolete versions and a tombstone."""
+        for round_number in range(1, 5):
+            for index in range(3):
+                self.ok("put", self.path, f"key:{index}",
+                        json.dumps({"round": round_number}))
+        self.ok("put", self.path, "doomed", "1")
+        self.ok("delete", self.path, "doomed")
+        return {f"key:{i}": {"round": 4} for i in range(3)}
+
+    def state(self):
+        lines = self.ok("scan", self.path).stdout.splitlines()
+        return {
+            line.partition("\t")[0]: json.loads(line.partition("\t")[2])
+            for line in lines
+        }
+
+    def test_compact_reports_before_and_after(self):
+        self.build_wasteful_store()
+        result = self.ok("compact", self.path)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertRegex(lines[0], r"^records: \d+ -> \d+$")
+        self.assertRegex(lines[1], r"^size:    .+ -> .+$")
+        self.assertEqual(lines[2], "status:  compacted")
+        self.assertEqual(result.stderr, "")
+
+    def test_compact_preserves_the_logical_state(self):
+        expected = self.build_wasteful_store()
+        before = self.state()
+        self.assertEqual(before, expected)
+        self.ok("compact", self.path)
+        self.assertEqual(self.state(), expected, "compaction changed state")
+
+    def test_compact_shrinks_the_store(self):
+        self.build_wasteful_store()
+        size_before = os.path.getsize(self.path)
+        records_before, records_after = (
+            int(part) for part in
+            self.ok("compact", self.path).stdout.splitlines()[0]
+            .removeprefix("records: ").split(" -> ")
+        )
+        self.assertLess(records_after, records_before)
+        self.assertLess(os.path.getsize(self.path), size_before)
+
+    def test_compact_drops_the_tombstone_and_its_record(self):
+        self.build_wasteful_store()
+        self.ok("compact", self.path)
+        ops = []
+        ledger.replay_log(
+            self.read_file(),
+            apply=lambda o, h, k, v: ops.append((h.op, k.decode())),
+        )
+        self.assertTrue(all(op == ledger.OP_PUT for op, _ in ops))
+        self.assertNotIn("doomed", [key for _, key in ops])
+
+    def test_compact_leaves_a_clean_log(self):
+        self.build_wasteful_store()
+        self.ok("compact", self.path)
+        report = ledger.replay_log(self.read_file())
+        self.assertEqual(report.tail_state, ledger.TAIL_CLEAN)
+        self.assertEqual(report.generation, 1)
+        self.assertEqual(report.last_valid_seq, report.valid_records)
+
+    def test_compact_is_idempotent(self):
+        self.build_wasteful_store()
+        self.ok("compact", self.path)
+        state = self.state()
+        second = self.ok("compact", self.path).stdout.splitlines()[0]
+        before, after = second.removeprefix("records: ").split(" -> ")
+        self.assertEqual(before, after, "an already compact store shrank")
+        self.assertEqual(self.state(), state)
+
+    def test_compact_of_an_empty_store(self):
+        self.ok("put", self.path, "k", "1")
+        self.ok("delete", self.path, "k")
+        self.ok("compact", self.path)
+        self.assertEqual(
+            os.path.getsize(self.path), ledger.FILE_HEADER_SIZE
+        )
+
+    def test_writes_continue_after_compaction(self):
+        expected = self.build_wasteful_store()
+        self.ok("compact", self.path)
+        self.ok("put", self.path, "after", '"ok"')
+        expected["after"] = "ok"
+        self.assertEqual(self.state(), expected)
+
+    def test_compact_repairs_a_torn_tail_first(self):
+        # compact opens read-write, where recovery is automatic.
+        expected = self.build_wasteful_store()
+        record = ledger.encode_record(ledger.OP_PUT, 99, b"torn", b"1")
+        with open(self.path, "ab") as handle:
+            handle.write(record[:20])
+        self.ok("compact", self.path)
+        self.assertEqual(self.state(), expected)
+        self.assertEqual(
+            ledger.replay_log(self.read_file()).tail_state, ledger.TAIL_CLEAN
+        )
+
+    def test_compact_of_a_missing_store_does_not_create_one(self):
+        missing = os.path.join(self.dir, "absent.ledger")
+        self.fails(ledger.EXIT_USAGE, "compact", missing)
+        self.assertFalse(os.path.exists(missing))
+
+    def test_compact_of_a_locked_store_exits_three(self):
+        self.ok("put", self.path, "k", "1")
+        holder = ledger.Ledger.open(self.path)
+        self.addCleanup(holder.close)
+        self.fails(ledger.EXIT_LOCKED, "compact", self.path)
+
+    def test_compact_of_a_corrupt_store_exits_two(self):
+        with open(self.path, "wb") as handle:
+            handle.write(b"NOT A LEDGER FILE" + b"\x00" * 32)
+        self.fails(ledger.EXIT_CORRUPT, "compact", self.path)
+
+    def test_compact_leaves_no_temporary_file(self):
+        self.build_wasteful_store()
+        self.ok("compact", self.path)
+        self.assertFalse(os.path.exists(self.path + ".compact"))
+
+
 class TestEntryPoints(CliTestCase):
     def test_module_and_script_entry_points_agree(self):
         self.ok("put", self.path, "k", '{"v":1}')
