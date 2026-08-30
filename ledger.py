@@ -26,11 +26,13 @@ and of a single record:
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import os
 import pathlib
 import struct
+import sys
 import zlib
 from dataclasses import dataclass
 
@@ -57,6 +59,7 @@ __all__ = [
     "WriteError",
     "CompactionError",
     "CompactionResult",
+    "forensic_scan",
 ]
 
 # --------------------------------------------------------------------------
@@ -1165,3 +1168,275 @@ def _encode_value(value) -> bytes:
             f"{MAX_VALUE_BYTES} byte limit"
         )
     return encoded
+
+
+# --------------------------------------------------------------------------
+# Command line interface
+# --------------------------------------------------------------------------
+#
+# A thin skin over the public API: every command opens a store, calls one
+# method, and prints the result.  No storage logic lives here.
+
+# Exit codes.  Deliberately few, and stable.
+EXIT_OK = 0
+EXIT_USAGE = 1      # bad arguments, bad JSON, missing key, missing file
+EXIT_CORRUPT = 2    # not a Ledger file, or a corrupt log we refused to open
+EXIT_LOCKED = 3     # another process holds the writer lock
+EXIT_IO = 4         # write, fsync or compaction failure
+
+# get() returns the caller's default for a missing key, and None is a
+# perfectly valid stored value, so distinguishing the two needs a sentinel.
+_MISSING = object()
+
+
+def _fail(message, code):
+    print(f"ledger: {message}", file=sys.stderr)
+    return code
+
+
+def _dump(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                      sort_keys=True)
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 for a usage error, but 2 is this CLI's code for a
+    corrupt store.  Usage errors are bad input, so they exit EXIT_USAGE
+    like every other bad input."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        raise SystemExit(_fail(message, EXIT_USAGE))
+
+    def exit(self, status=0, message=None):
+        if message:
+            print(message, file=sys.stderr)
+        raise SystemExit(EXIT_USAGE if status == 2 else status)
+
+
+def _cmd_put(args):
+    """Read commands never lock; write commands do, and repair on open."""
+    try:
+        value = json.loads(args.value)
+    except json.JSONDecodeError as error:
+        return _fail(f"VALUE is not valid JSON: {error}", EXIT_USAGE)
+    try:
+        with Ledger.open(args.file) as db:
+            db.put(args.key, value)
+    except (TypeError, ValueError) as error:
+        return _fail(str(error), EXIT_USAGE)
+    return EXIT_OK
+
+
+def _cmd_get(args):
+    with Ledger.open(args.file, mode=MODE_READ) as db:
+        value = db.get(args.key, _MISSING)
+    if value is _MISSING:
+        return _fail(f"key not found: {args.key}", EXIT_USAGE)
+    print(_dump(value))
+    return EXIT_OK
+
+
+def _cmd_delete(args):
+    # Opening for write would create the store, so deleting a key from a
+    # store that does not exist would silently leave an empty one behind.
+    # Only put brings a store into existence.
+    if not os.path.exists(args.file):
+        raise FileNotFoundError(args.file)
+    with Ledger.open(args.file) as db:
+        try:
+            deleted = db.delete(args.key)
+        except (TypeError, ValueError) as error:
+            return _fail(str(error), EXIT_USAGE)
+    if not deleted:
+        return _fail(f"key not found: {args.key}", EXIT_USAGE)
+    return EXIT_OK
+
+
+def _cmd_scan(args):
+    with Ledger.open(args.file, mode=MODE_READ) as db:
+        for key, value in db.scan(prefix=args.prefix):
+            print(f"{key}\t{_dump(value)}")
+    return EXIT_OK
+
+
+def _human_bytes(count):
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if count < 1024 or unit == "GiB":
+            return f"{count:.1f} {unit}" if unit != "B" else f"{count} B"
+        count /= 1024
+
+
+def forensic_scan(data, start):
+    """Look for record-shaped bytes beyond a damaged region.
+
+    Purely informational. This never feeds recovery: it does not change
+    the replay result, the repair boundary or the logical state, and
+    nothing it finds is ever loaded into a store. Recovery stops at the
+    first bad record on purpose (DESIGN.md section 10) because past a
+    damaged region a real record cannot be told from stale bytes left in a
+    reused block. This function exists so a human can see what that
+    decision is discarding, and decide for themselves.
+
+    Returns ``(markers, plausible)``: how many record magics appear after
+    ``start``, and how many of those are followed by a header that decodes.
+    """
+    markers = 0
+    plausible = 0
+    offset = data.find(RECORD_MAGIC, start)
+    while offset != -1:
+        markers += 1
+        candidate = data[offset : offset + RECORD_HEADER_SIZE]
+        if len(candidate) == RECORD_HEADER_SIZE:
+            try:
+                decode_record_header(candidate)
+                plausible += 1
+            except CorruptRecordError:
+                pass
+        offset = data.find(RECORD_MAGIC, offset + 1)
+    return markers, plausible
+
+
+def _cmd_inspect(args):
+    """Report on a store without touching it.
+
+    Deliberately does not go through Ledger.open: opening read-write would
+    lock and repair, and even a read-only open raises on a corrupt tail
+    rather than describing it. Diagnosis has to survive the very damage it
+    is meant to describe, so this reads the bytes and replays them through
+    the public reader instead.
+    """
+    with open(args.file, "rb") as handle:
+        data = handle.read()
+
+    live = {}
+
+    def apply(offset, header, key, value):
+        if header.op == OP_PUT:
+            live[key] = len(key) + len(value)
+        else:
+            live.pop(key, None)
+
+    report = replay_log(data, apply=apply)
+
+    body = max(report.valid_end_offset - FILE_HEADER_SIZE, 0)
+    live_bytes = sum(
+        RECORD_HEADER_SIZE + payload for payload in live.values()
+    )
+    dead = max(body - live_bytes, 0)
+
+    print(f"path:             {args.file}")
+    print(f"file size:        {_human_bytes(report.file_size)} "
+          f"({report.file_size} bytes)")
+    print(f"format version:   {FORMAT_VERSION}")
+    print(f"generation:       {report.generation}")
+    print(f"valid records:    {report.valid_records}")
+    print(f"live keys:        {len(live)}")
+    print(f"valid end offset: {report.valid_end_offset}")
+    print(f"tail state:       {report.tail_state.upper()}")
+    print(f"tail reason:      {report.tail_reason or '-'}")
+    print(f"discarded bytes:  {report.discarded_bytes}")
+    if body:
+        print(f"dead bytes:       {dead} ({dead / body:.1%} reclaimable)")
+    else:
+        print("dead bytes:       0")
+    print(f"repair required:  {'yes' if report.repair_required else 'no'}")
+
+    if report.repair_required:
+        markers, plausible = forensic_scan(data, report.valid_end_offset)
+        if markers:
+            print()
+            print("forensic scan beyond the damage "
+                  "(UNTRUSTED / NOT RECOVERED):")
+            print(f"  record markers found:   {markers}")
+            print(f"  headers that decode:    {plausible}")
+            print("  These bytes are NOT part of the recovered state and "
+                  "never will be.")
+            print("  Recovery stops at the first bad record because past it "
+                  "a real record")
+            print("  cannot be told from stale bytes in a reused block.")
+    return EXIT_OK
+
+
+def _cmd_compact(args):
+    if not os.path.exists(args.file):
+        raise FileNotFoundError(args.file)
+    with Ledger.open(args.file) as db:
+        result = db.compact()
+    print(f"records: {result.records_before} -> {result.records_after}")
+    print(f"size:    {_human_bytes(result.bytes_before)} -> "
+          f"{_human_bytes(result.bytes_after)}")
+    print("status:  compacted")
+    return EXIT_OK
+
+
+def _build_parser():
+    parser = _Parser(
+        prog="ledger",
+        description="Crash-safe embedded state store.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    put = commands.add_parser("put", help="store VALUE (JSON) under KEY")
+    put.add_argument("file")
+    put.add_argument("key")
+    put.add_argument("value", metavar="VALUE", help="a JSON document")
+    put.set_defaults(run=_cmd_put)
+
+    get = commands.add_parser("get", help="print the value stored under KEY")
+    get.add_argument("file")
+    get.add_argument("key")
+    get.set_defaults(run=_cmd_get)
+
+    delete = commands.add_parser("delete", help="remove KEY")
+    delete.add_argument("file")
+    delete.add_argument("key")
+    delete.set_defaults(run=_cmd_delete)
+
+    scan = commands.add_parser("scan", help="print every key and value")
+    scan.add_argument("file")
+    scan.add_argument("--prefix", default="", help="only keys with this prefix")
+    scan.set_defaults(run=_cmd_scan)
+
+    inspect = commands.add_parser(
+        "inspect", help="report on a store without modifying it"
+    )
+    inspect.add_argument("file")
+    inspect.set_defaults(run=_cmd_inspect)
+
+    compact = commands.add_parser(
+        "compact", help="rewrite the log without obsolete records"
+    )
+    compact.add_argument("file")
+    compact.set_defaults(run=_cmd_compact)
+
+    return parser
+
+
+def main(argv=None):
+    """Entry point for ``python3 -m ledger`` and ``python3 ledger.py``.
+
+    Expected failures print one line to stderr and return a fixed exit
+    code; none of them produce a traceback.  An unexpected exception is a
+    bug in Ledger and is deliberately left to propagate, because a
+    stack trace is more use than a swallowed error.
+    """
+    args = _build_parser().parse_args(argv)
+    try:
+        return args.run(args)
+    except FileNotFoundError:
+        return _fail(f"no such store: {args.file}", EXIT_USAGE)
+    except IsADirectoryError:
+        return _fail(f"not a file: {args.file}", EXIT_USAGE)
+    except LockedError as error:
+        return _fail(str(error), EXIT_LOCKED)
+    except (FormatError, CorruptLogError) as error:
+        return _fail(str(error), EXIT_CORRUPT)
+    except (WriteError, CompactionError) as error:
+        return _fail(str(error), EXIT_IO)
+    except OSError as error:
+        return _fail(f"{args.file}: {error}", EXIT_IO)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
