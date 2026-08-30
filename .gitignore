@@ -3,9 +3,9 @@
 __pycache__/
 *.py[cod]
 
-# Build output. The published digest lives in dist/SHA256SUMS.
+# Build output. Reproducibility is verified by building twice and
+# comparing bytes (tools/build.py --verify), not by a committed digest.
 /dist/
-!/dist/SHA256SUMS
 
 # Ledger stores and their sidecars, in case one is created while testing.
 *.ledger
