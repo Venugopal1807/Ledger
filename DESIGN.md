@@ -773,30 +773,49 @@ Documented limitations, stated as limitations:
 `python -m ledger`, or `./ledger.pyz` (the zipapp, §24).
 
 ```
-ledger put     FILE KEY VALUE [--json]
+ledger put     FILE KEY VALUE
 ledger get     FILE KEY
 ledger delete  FILE KEY
-ledger scan    FILE [--prefix P] [--json]
-ledger inspect FILE [--json] [--verbose]
+ledger scan    FILE [--prefix P]
+ledger inspect FILE
 ledger compact FILE
 ```
 
-- `put` treats `VALUE` as a plain string by default; `--json` parses it as JSON
-  first. String-by-default is the unsurprising behaviour for
-  `ledger put db.ledger name Venu`, and `--json` is explicit for structured
-  values. Guessing between the two would make `ledger put db count 42`
-  ambiguous.
-- `get` prints the value as JSON on stdout, so output is unambiguous and pipeable.
-- `scan` prints `key<TAB>json_value` per line, sorted by key. `--json` emits a
-  single JSON object instead.
-- `inspect` is **read-only**: it opens in `mode="r"`, never locks, never
-  truncates, and never repairs. It reports: file size, `generation`, format
-  version, total records, valid records, live keys, dead bytes and dead-byte
-  ratio, tail state (`CLEAN`/`TORN`/`CORRUPT`) with the offset and the specific
-  reason, and — when the tail is damaged — the result of a resynchronisation
-  scan for further `LGR\x1e` markers beyond it, so a human can see what
-  automatic recovery is choosing to discard. This is the diagnostic centrepiece
-  of the demo.
+- `put` treats `VALUE` as **JSON**, with no flag to say so. JSON is already
+  the store's value contract, so a `--json` switch would only create a second
+  mode to get wrong; `ledger put db count 42` stores the number 42, and
+  `ledger put db name '"Venu"'` stores the string. Invalid JSON is a usage
+  error and writes nothing.
+- `put` and `delete` print nothing on success. Output means something
+  happened that the operator needs to know about.
+- `get` prints the value as one line of JSON on stdout, so output is
+  unambiguous and pipeable. A missing key is a usage error, distinguished
+  from a stored `null` by a sentinel rather than by the API default.
+- `scan` prints `key<TAB>json_value` per line, sorted by key, optionally
+  filtered by `--prefix`. No `--json` mode, no table renderer, no colour.
+- **`get` and `scan` open read-only**; they take no writer lock and never
+  modify the file, so a query cannot be blocked by a running application or
+  quietly repair something behind the operator's back. `put`, `delete` and
+  `compact` open read-write, where recovery is automatic.
+- `inspect` is **read-only**, and does not go through `Ledger.open` at all.
+  A read-write open would lock and repair the very damage the command exists
+  to describe, and even a read-only open raises on a corrupt tail rather than
+  reporting it — diagnosis has to survive the damage it diagnoses. So inspect
+  reads the bytes and replays them through the public reader. This is the one
+  place the CLI is permitted to touch WAL bytes directly. It reports file
+  size, `generation`, format version, valid records, live keys, valid end
+  offset, tail state (`CLEAN`/`TORN`/`CORRUPT`) with the specific reason,
+  discarded bytes, and reclaimable dead bytes with their ratio.
+- When the tail is damaged, `inspect` also scans beyond it for further
+  `LGR\x1e` markers and reports how many appear and how many carry a header
+  that decodes. This is **informational only**, printed under a heading that
+  says `UNTRUSTED / NOT RECOVERED`, with the reason stated: recovery stops at
+  the first bad record because past it a real record cannot be told from stale
+  bytes in a reused block. The scan is a pure function of the bytes and cannot
+  alter the replay result, the repair boundary, or the logical state. Its
+  sharpest use is the case where a record after the damage is provably intact
+  yet unreachable — inspect makes the cost of conservative recovery visible
+  without ever paying it. This is the diagnostic centrepiece of the demo.
 - `compact` opens `rw` (so it takes the lock and repairs), compacts, and prints
   before/after sizes.
 
@@ -813,11 +832,21 @@ Exit codes, fixed and testable:
 | Code | Meaning |
 | --- | --- |
 | 0 | Success |
-| 1 | Key not found (`get`, `delete`) |
-| 2 | Usage error (argparse) |
-| 3 | Store locked by another process |
-| 4 | Format error or corrupt log with `repair` refused |
-| 5 | I/O error |
+| 1 | Bad input: bad arguments, invalid JSON, missing key, missing store |
+| 2 | Corrupt or unreadable store |
+| 3 | Store locked by another writer |
+| 4 | Write, fsync or compaction failure |
+
+Five codes, no more. argparse's own usage errors are remapped from its
+default 2 to 1, because 2 here means a corrupt store and a bad command line
+is bad input like any other. Expected failures print one concise line to
+stderr and never a traceback; an unexpected exception is a bug in Ledger and
+is deliberately left to propagate, because a stack trace is more use than a
+swallowed error. There is no `--debug` flag, since there is nothing yet for
+it to reveal.
+
+The entry point is `python3 -m ledger`, which needs no packaging at all;
+running `ledger.py` directly works identically.
 
 Everything the CLI prints on success goes to stdout; diagnostics and warnings
 go to stderr. No colours, no spinners, no progress bars — the output is meant
