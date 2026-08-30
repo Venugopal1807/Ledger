@@ -48,6 +48,7 @@ ROLES = (
     ("production", lambda relative: relative.parent == pathlib.Path(".")),
     ("tools", lambda relative: relative.parts[0] == "tools"),
     ("tests", lambda relative: relative.parts[0] == "tests"),
+    ("demo", lambda relative: relative.parts[0] == "demo"),
 )
 
 
