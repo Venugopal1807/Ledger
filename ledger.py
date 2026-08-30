@@ -26,11 +26,13 @@ and of a single record:
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import os
 import pathlib
 import struct
+import sys
 import zlib
 from dataclasses import dataclass
 
@@ -1165,3 +1167,153 @@ def _encode_value(value) -> bytes:
             f"{MAX_VALUE_BYTES} byte limit"
         )
     return encoded
+
+
+# --------------------------------------------------------------------------
+# Command line interface
+# --------------------------------------------------------------------------
+#
+# A thin skin over the public API: every command opens a store, calls one
+# method, and prints the result.  No storage logic lives here.
+
+# Exit codes.  Deliberately few, and stable.
+EXIT_OK = 0
+EXIT_USAGE = 1      # bad arguments, bad JSON, missing key, missing file
+EXIT_CORRUPT = 2    # not a Ledger file, or a corrupt log we refused to open
+EXIT_LOCKED = 3     # another process holds the writer lock
+EXIT_IO = 4         # write, fsync or compaction failure
+
+# get() returns the caller's default for a missing key, and None is a
+# perfectly valid stored value, so distinguishing the two needs a sentinel.
+_MISSING = object()
+
+
+def _fail(message, code):
+    print(f"ledger: {message}", file=sys.stderr)
+    return code
+
+
+def _dump(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"),
+                      sort_keys=True)
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 for a usage error, but 2 is this CLI's code for a
+    corrupt store.  Usage errors are bad input, so they exit EXIT_USAGE
+    like every other bad input."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        raise SystemExit(_fail(message, EXIT_USAGE))
+
+    def exit(self, status=0, message=None):
+        if message:
+            print(message, file=sys.stderr)
+        raise SystemExit(EXIT_USAGE if status == 2 else status)
+
+
+def _cmd_put(args):
+    """Read commands never lock; write commands do, and repair on open."""
+    try:
+        value = json.loads(args.value)
+    except json.JSONDecodeError as error:
+        return _fail(f"VALUE is not valid JSON: {error}", EXIT_USAGE)
+    try:
+        with Ledger.open(args.file) as db:
+            db.put(args.key, value)
+    except (TypeError, ValueError) as error:
+        return _fail(str(error), EXIT_USAGE)
+    return EXIT_OK
+
+
+def _cmd_get(args):
+    with Ledger.open(args.file, mode=MODE_READ) as db:
+        value = db.get(args.key, _MISSING)
+    if value is _MISSING:
+        return _fail(f"key not found: {args.key}", EXIT_USAGE)
+    print(_dump(value))
+    return EXIT_OK
+
+
+def _cmd_delete(args):
+    # Opening for write would create the store, so deleting a key from a
+    # store that does not exist would silently leave an empty one behind.
+    # Only put brings a store into existence.
+    if not os.path.exists(args.file):
+        raise FileNotFoundError(args.file)
+    with Ledger.open(args.file) as db:
+        try:
+            deleted = db.delete(args.key)
+        except (TypeError, ValueError) as error:
+            return _fail(str(error), EXIT_USAGE)
+    if not deleted:
+        return _fail(f"key not found: {args.key}", EXIT_USAGE)
+    return EXIT_OK
+
+
+def _cmd_scan(args):
+    with Ledger.open(args.file, mode=MODE_READ) as db:
+        for key, value in db.scan(prefix=args.prefix):
+            print(f"{key}\t{_dump(value)}")
+    return EXIT_OK
+
+
+def _build_parser():
+    parser = _Parser(
+        prog="ledger",
+        description="Crash-safe embedded state store.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    put = commands.add_parser("put", help="store VALUE (JSON) under KEY")
+    put.add_argument("file")
+    put.add_argument("key")
+    put.add_argument("value", metavar="VALUE", help="a JSON document")
+    put.set_defaults(run=_cmd_put)
+
+    get = commands.add_parser("get", help="print the value stored under KEY")
+    get.add_argument("file")
+    get.add_argument("key")
+    get.set_defaults(run=_cmd_get)
+
+    delete = commands.add_parser("delete", help="remove KEY")
+    delete.add_argument("file")
+    delete.add_argument("key")
+    delete.set_defaults(run=_cmd_delete)
+
+    scan = commands.add_parser("scan", help="print every key and value")
+    scan.add_argument("file")
+    scan.add_argument("--prefix", default="", help="only keys with this prefix")
+    scan.set_defaults(run=_cmd_scan)
+
+    return parser
+
+
+def main(argv=None):
+    """Entry point for ``python3 -m ledger`` and ``python3 ledger.py``.
+
+    Expected failures print one line to stderr and return a fixed exit
+    code; none of them produce a traceback.  An unexpected exception is a
+    bug in Ledger and is deliberately left to propagate, because a
+    stack trace is more use than a swallowed error.
+    """
+    args = _build_parser().parse_args(argv)
+    try:
+        return args.run(args)
+    except FileNotFoundError:
+        return _fail(f"no such store: {args.file}", EXIT_USAGE)
+    except IsADirectoryError:
+        return _fail(f"not a file: {args.file}", EXIT_USAGE)
+    except LockedError as error:
+        return _fail(str(error), EXIT_LOCKED)
+    except (FormatError, CorruptLogError) as error:
+        return _fail(str(error), EXIT_CORRUPT)
+    except (WriteError, CompactionError) as error:
+        return _fail(str(error), EXIT_IO)
+    except OSError as error:
+        return _fail(f"{args.file}: {error}", EXIT_IO)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
