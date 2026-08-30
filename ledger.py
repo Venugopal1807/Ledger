@@ -59,6 +59,7 @@ __all__ = [
     "WriteError",
     "CompactionError",
     "CompactionResult",
+    "forensic_scan",
 ]
 
 # --------------------------------------------------------------------------
@@ -1259,6 +1260,104 @@ def _cmd_scan(args):
     return EXIT_OK
 
 
+def _human_bytes(count):
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if count < 1024 or unit == "GiB":
+            return f"{count:.1f} {unit}" if unit != "B" else f"{count} B"
+        count /= 1024
+
+
+def forensic_scan(data, start):
+    """Look for record-shaped bytes beyond a damaged region.
+
+    Purely informational. This never feeds recovery: it does not change
+    the replay result, the repair boundary or the logical state, and
+    nothing it finds is ever loaded into a store. Recovery stops at the
+    first bad record on purpose (DESIGN.md section 10) because past a
+    damaged region a real record cannot be told from stale bytes left in a
+    reused block. This function exists so a human can see what that
+    decision is discarding, and decide for themselves.
+
+    Returns ``(markers, plausible)``: how many record magics appear after
+    ``start``, and how many of those are followed by a header that decodes.
+    """
+    markers = 0
+    plausible = 0
+    offset = data.find(RECORD_MAGIC, start)
+    while offset != -1:
+        markers += 1
+        candidate = data[offset : offset + RECORD_HEADER_SIZE]
+        if len(candidate) == RECORD_HEADER_SIZE:
+            try:
+                decode_record_header(candidate)
+                plausible += 1
+            except CorruptRecordError:
+                pass
+        offset = data.find(RECORD_MAGIC, offset + 1)
+    return markers, plausible
+
+
+def _cmd_inspect(args):
+    """Report on a store without touching it.
+
+    Deliberately does not go through Ledger.open: opening read-write would
+    lock and repair, and even a read-only open raises on a corrupt tail
+    rather than describing it. Diagnosis has to survive the very damage it
+    is meant to describe, so this reads the bytes and replays them through
+    the public reader instead.
+    """
+    with open(args.file, "rb") as handle:
+        data = handle.read()
+
+    live = {}
+
+    def apply(offset, header, key, value):
+        if header.op == OP_PUT:
+            live[key] = len(key) + len(value)
+        else:
+            live.pop(key, None)
+
+    report = replay_log(data, apply=apply)
+
+    body = max(report.valid_end_offset - FILE_HEADER_SIZE, 0)
+    live_bytes = sum(
+        RECORD_HEADER_SIZE + payload for payload in live.values()
+    )
+    dead = max(body - live_bytes, 0)
+
+    print(f"path:             {args.file}")
+    print(f"file size:        {_human_bytes(report.file_size)} "
+          f"({report.file_size} bytes)")
+    print(f"format version:   {FORMAT_VERSION}")
+    print(f"generation:       {report.generation}")
+    print(f"valid records:    {report.valid_records}")
+    print(f"live keys:        {len(live)}")
+    print(f"valid end offset: {report.valid_end_offset}")
+    print(f"tail state:       {report.tail_state.upper()}")
+    print(f"tail reason:      {report.tail_reason or '-'}")
+    print(f"discarded bytes:  {report.discarded_bytes}")
+    if body:
+        print(f"dead bytes:       {dead} ({dead / body:.1%} reclaimable)")
+    else:
+        print("dead bytes:       0")
+    print(f"repair required:  {'yes' if report.repair_required else 'no'}")
+
+    if report.repair_required:
+        markers, plausible = forensic_scan(data, report.valid_end_offset)
+        if markers:
+            print()
+            print("forensic scan beyond the damage "
+                  "(UNTRUSTED / NOT RECOVERED):")
+            print(f"  record markers found:   {markers}")
+            print(f"  headers that decode:    {plausible}")
+            print("  These bytes are NOT part of the recovered state and "
+                  "never will be.")
+            print("  Recovery stops at the first bad record because past it "
+                  "a real record")
+            print("  cannot be told from stale bytes in a reused block.")
+    return EXIT_OK
+
+
 def _build_parser():
     parser = _Parser(
         prog="ledger",
@@ -1286,6 +1385,12 @@ def _build_parser():
     scan.add_argument("file")
     scan.add_argument("--prefix", default="", help="only keys with this prefix")
     scan.set_defaults(run=_cmd_scan)
+
+    inspect = commands.add_parser(
+        "inspect", help="report on a store without modifying it"
+    )
+    inspect.add_argument("file")
+    inspect.set_defaults(run=_cmd_inspect)
 
     return parser
 

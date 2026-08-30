@@ -328,6 +328,193 @@ class TestStreamDiscipline(CliTestCase):
         self.assertNotIn("\x1b[", result.stdout, "no terminal escape codes")
 
 
+class TestInspect(CliTestCase):
+    def fields(self, stdout):
+        """Parse the report into a dict, ignoring the forensic section."""
+        parsed = {}
+        for line in stdout.splitlines():
+            if not line or line.startswith(" ") or ":" not in line:
+                continue
+            name, _, value = line.partition(":")
+            parsed[name.strip()] = value.strip()
+        return parsed
+
+    def make_store(self):
+        self.ok("put", self.path, "a", '{"v":1}')
+        self.ok("put", self.path, "a", '{"v":2}')
+        self.ok("put", self.path, "b", '"x"')
+
+    def append(self, payload):
+        with open(self.path, "ab") as handle:
+            handle.write(payload)
+
+    def snapshot(self):
+        """Everything inspect must leave untouched."""
+        return (
+            sorted(os.listdir(self.dir)),
+            self.read_file(),
+            os.stat(self.path).st_mtime_ns,
+        )
+
+    def test_inspect_clean_store(self):
+        self.make_store()
+        report = self.fields(self.ok("inspect", self.path).stdout)
+        self.assertEqual(report["tail state"], "CLEAN")
+        self.assertEqual(report["tail reason"], "-")
+        self.assertEqual(report["valid records"], "3")
+        self.assertEqual(report["live keys"], "2")
+        self.assertEqual(report["generation"], "0")
+        self.assertEqual(report["discarded bytes"], "0")
+        self.assertEqual(report["repair required"], "no")
+        self.assertEqual(
+            report["valid end offset"], str(os.path.getsize(self.path))
+        )
+
+    def test_inspect_reports_reclaimable_dead_bytes(self):
+        self.make_store()  # one obsolete version of "a"
+        report = self.fields(self.ok("inspect", self.path).stdout)
+        self.assertIn("reclaimable", report["dead bytes"])
+        self.assertNotEqual(report["dead bytes"].split()[0], "0")
+
+    def test_inspect_empty_store(self):
+        self.ok("put", self.path, "k", "1")
+        self.ok("delete", self.path, "k")
+        report = self.fields(self.ok("inspect", self.path).stdout)
+        self.assertEqual(report["live keys"], "0")
+        self.assertEqual(report["tail state"], "CLEAN")
+
+    def test_inspect_torn_store(self):
+        self.make_store()
+        record = ledger.encode_record(ledger.OP_PUT, 4, b"torn", b"1")
+        self.append(record[:20])
+        report = self.fields(self.ok("inspect", self.path).stdout)
+        self.assertEqual(report["tail state"], "TORN")
+        self.assertEqual(report["tail reason"], ledger.REASON_SHORT_HEADER)
+        self.assertEqual(report["discarded bytes"], "20")
+        self.assertEqual(report["repair required"], "yes")
+        self.assertEqual(report["valid records"], "3")
+
+    def test_inspect_corrupt_store(self):
+        self.make_store()
+        record = ledger.encode_record(ledger.OP_PUT, 4, b"bad", b"1")
+        self.append(bytes([record[4] ^ 0x01]).join([record[:4], record[5:]]))
+        report = self.fields(self.ok("inspect", self.path).stdout)
+        self.assertEqual(report["tail state"], "CORRUPT")
+        self.assertEqual(report["tail reason"], ledger.REASON_HEADER_CRC)
+        self.assertEqual(report["repair required"], "yes")
+
+    def test_inspect_never_modifies_the_store(self):
+        """The guarantee that makes inspect safe to run on a damaged file."""
+        self.make_store()
+        record = ledger.encode_record(ledger.OP_PUT, 4, b"torn", b"1")
+        self.append(record[:20])
+        before = self.snapshot()
+        for _ in range(3):
+            self.ok("inspect", self.path)
+        self.assertEqual(self.snapshot(), before, "inspect changed the store")
+
+    def test_inspect_does_not_repair_a_torn_tail(self):
+        self.make_store()
+        record = ledger.encode_record(ledger.OP_PUT, 4, b"torn", b"1")
+        self.append(record[:20])
+        size = os.path.getsize(self.path)
+        self.ok("inspect", self.path)
+        self.assertEqual(os.path.getsize(self.path), size, "inspect truncated")
+        self.assertEqual(
+            ledger.replay_log(self.read_file()).tail_state, ledger.TAIL_TORN,
+            "the tail must still be there for a writer to repair",
+        )
+
+    def test_inspect_creates_no_lock_file(self):
+        self.make_store()
+        os.remove(self.path + ".lock")
+        self.ok("inspect", self.path)
+        self.assertFalse(os.path.exists(self.path + ".lock"))
+
+    def test_inspect_works_while_a_writer_holds_the_lock(self):
+        self.make_store()
+        holder = ledger.Ledger.open(self.path)
+        self.addCleanup(holder.close)
+        report = self.fields(self.ok("inspect", self.path).stdout)
+        self.assertEqual(report["tail state"], "CLEAN")
+
+    def test_inspect_does_not_compact(self):
+        self.make_store()
+        before = self.read_file()
+        self.ok("inspect", self.path)
+        self.assertEqual(self.read_file(), before)
+
+    def test_inspect_of_a_missing_store(self):
+        missing = os.path.join(self.dir, "absent.ledger")
+        self.fails(ledger.EXIT_USAGE, "inspect", missing)
+
+    def test_inspect_of_a_non_ledger_file(self):
+        with open(self.path, "wb") as handle:
+            handle.write(b"NOT A LEDGER FILE" + b"\x00" * 32)
+        self.fails(ledger.EXIT_CORRUPT, "inspect", self.path)
+
+
+class TestForensicScan(CliTestCase):
+    """Beyond-the-damage scanning is informational only, and must be
+    unmistakably labelled as such."""
+
+    def build_with_valid_records_after_damage(self):
+        """Three valid records, the second corrupted, so the third is
+        intact on disk yet unreachable by recovery."""
+        db = ledger.Ledger.open(self.path)
+        for index in range(1, 4):
+            db.put(f"k{index}", {"n": index})
+        db.close()
+        data = self.read_file()
+        offsets = [ledger.FILE_HEADER_SIZE]
+        for index in range(1, 4):
+            header = ledger.decode_record_header(
+                data[offsets[-1]:offsets[-1] + ledger.RECORD_HEADER_SIZE]
+            )
+            offsets.append(offsets[-1] + header.total_size)
+        target = offsets[1] + ledger.RECORD_HEADER_SIZE  # record 2's payload
+        damaged = bytearray(data)
+        damaged[target] ^= 0xFF
+        with open(self.path, "wb") as handle:
+            handle.write(bytes(damaged))
+        return offsets
+
+    def test_intact_records_after_damage_are_reported_but_not_recovered(self):
+        self.build_with_valid_records_after_damage()
+        stdout = self.ok("inspect", self.path).stdout
+        self.assertIn("UNTRUSTED / NOT RECOVERED", stdout)
+        self.assertIn("record markers found:", stdout)
+        self.assertIn("headers that decode:", stdout)
+        # Records 2 and 3 both still carry a decodable header.
+        self.assertIn("headers that decode:    2", stdout)
+        # But recovery keeps only record 1.
+        report = ledger.replay_log(self.read_file())
+        self.assertEqual(report.valid_records, 1)
+
+    def test_forensic_scan_does_not_change_recovery(self):
+        self.build_with_valid_records_after_damage()
+        before = ledger.replay_log(self.read_file())
+        self.ok("inspect", self.path)
+        after = ledger.replay_log(self.read_file())
+        self.assertEqual(before, after, "inspect altered the replay result")
+
+    def test_forensic_output_is_absent_on_a_clean_store(self):
+        self.ok("put", self.path, "k", "1")
+        stdout = self.ok("inspect", self.path).stdout
+        self.assertNotIn("UNTRUSTED", stdout)
+        self.assertNotIn("forensic", stdout)
+
+    def test_forensic_scan_is_a_pure_function_of_the_bytes(self):
+        self.build_with_valid_records_after_damage()
+        data = self.read_file()
+        report = ledger.replay_log(data)
+        first = ledger.forensic_scan(data, report.valid_end_offset)
+        self.assertEqual(
+            first, ledger.forensic_scan(data, report.valid_end_offset)
+        )
+        self.assertEqual(self.read_file(), data, "scanning mutated the data")
+
+
 class TestEntryPoints(CliTestCase):
     def test_module_and_script_entry_points_agree(self):
         self.ok("put", self.path, "k", '{"v":1}')
