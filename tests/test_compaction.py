@@ -445,6 +445,76 @@ class TestCompactionFailureHandling(CompactionTestCase):
         db.put("k", 2)
         self.assertEqual(db.get("k"), 2)
 
+    def test_directory_fsync_failure_after_replace_poisons_the_handle(self):
+        """os.replace has already happened, so the compacted log is
+        authoritative - but this handle still holds a descriptor on the old
+        inode, which the replace unlinked. Writing through it would land in
+        a file nothing can ever read while the index reported success, so
+        the handle must refuse to continue.
+        """
+        import stat as stat_module
+
+        db = self.open()
+        for round_number in range(3):
+            for key in range(3):
+                db.put(f"k{key}", {"round": round_number})
+        before = dict(db.scan())
+        records_before = ledger.replay_log(self.read_file()).valid_records
+
+        real_fsync = os.fsync
+
+        def failing(fd):
+            # EINVAL on a directory fsync is real on some filesystems.
+            if stat_module.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(22, "Invalid argument")
+            return real_fsync(fd)
+
+        os.fsync = failing
+        self.addCleanup(lambda: setattr(os, "fsync", real_fsync))
+        with self.assertRaises(ledger.WriteError):
+            db.compact()
+        os.fsync = real_fsync
+
+        self.assertIsNotNone(db._poisoned, "handle must be poisoned")
+        for name, operation in (
+            ("put", lambda: db.put("after", 1)),
+            ("delete", lambda: db.delete("k0")),
+            ("compact", lambda: db.compact()),
+            ("get", lambda: db.get("k0")),
+        ):
+            with self.subTest(operation=name):
+                with self.assertRaises(ledger.WriteError):
+                    operation()
+        db.close()
+
+        # The replace stood: reopening finds the compacted log, not the old
+        # one, and the logical state is unchanged.
+        report = ledger.replay_log(self.read_file())
+        self.assertEqual(report.generation, 1, "compacted log not in place")
+        self.assertEqual(report.tail_state, ledger.TAIL_CLEAN)
+        self.assertLess(report.valid_records, records_before)
+        reopened = self.open()
+        self.assertEqual(dict(reopened.scan()), before)
+        self.assertNotIn("after", reopened, "a stale-fd write became visible")
+        self.assertEqual(self.replay_state(), before)
+
+    def test_directory_fsync_failure_loses_no_acknowledged_write(self):
+        """The invariant the failure used to break: index == replay(WAL)."""
+        import stat as stat_module
+
+        db = self.open()
+        db.put("committed", {"v": 1})
+        db.put("committed", {"v": 2})
+        real_fsync = os.fsync
+        os.fsync = lambda fd: (_ for _ in ()).throw(OSError(22, "EINVAL")) \
+            if stat_module.S_ISDIR(os.fstat(fd).st_mode) else real_fsync(fd)
+        self.addCleanup(lambda: setattr(os, "fsync", real_fsync))
+        with self.assertRaises(ledger.WriteError):
+            db.compact()
+        os.fsync = real_fsync
+        db.close()
+        self.assertEqual(self.replay_state(), {"committed": {"v": 2}})
+
     def test_stale_temp_file_is_removed_on_open(self):
         db = self.open()
         db.put("k", 1)

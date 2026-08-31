@@ -989,10 +989,22 @@ class Ledger:
 
         # Past this line the new file is the authoritative log. The rename
         # itself is a directory operation, so fsyncing the file would not
-        # persist it; the directory must be fsynced instead. If this fails
-        # the store is still coherent - the path names one complete log or
-        # the other - but the rename may not survive a power cut.
-        _fsync_directory(self._path)
+        # persist it; the directory must be fsynced instead.
+        try:
+            _fsync_directory(self._path)
+        except OSError as error:
+            # The replace already happened, so the compacted log is in place
+            # and reopening will find it. But this handle still holds a
+            # descriptor on the old inode, which os.replace has now unlinked:
+            # anything written through it would land in a file nothing can
+            # ever read again, while the index reported success. Poison the
+            # handle rather than let it continue.
+            self._poisoned = error
+            raise WriteError(
+                f"{self._path}: the log was replaced but the directory fsync "
+                f"failed ({error}); the compacted log is authoritative and "
+                f"reopening will see it, but this handle is no longer usable"
+            ) from error
 
         try:
             old_fd = self._fd
