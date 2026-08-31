@@ -201,14 +201,14 @@ python3 tools/build.py --verify
 ```
 
 ```
-build 1: dbc5b0dac7b7314d8eec9da8f247f0d7d8bd3bbf3b9a130fefaca8d74454925e  (14973 bytes)
-build 2: dbc5b0dac7b7314d8eec9da8f247f0d7d8bd3bbf3b9a130fefaca8d74454925e  (14973 bytes)
+build 1: c8ae823ba7acfe2813d9ff59f8fc0d54db0f63378e0d4332eec401e4a2cf96d7  (15453 bytes)
+build 2: c8ae823ba7acfe2813d9ff59f8fc0d54db0f63378e0d4332eec401e4a2cf96d7  (15453 bytes)
 reproducible: identical bytes
 ```
 
-**`dist/ledger.pyz` — 14,973 bytes**
+**`dist/ledger.pyz` — 15,453 bytes**
 
-**SHA-256: `dbc5b0dac7b7314d8eec9da8f247f0d7d8bd3bbf3b9a130fefaca8d74454925e`**
+**SHA-256: `c8ae823ba7acfe2813d9ff59f8fc0d54db0f63378e0d4332eec401e4a2cf96d7`**
 
 Verified identical when built by CPython 3.10, 3.11, 3.12 and 3.13, from
 different directories, and under different umasks. Member order, timestamps,
