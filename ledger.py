@@ -611,10 +611,22 @@ class WriteError(LedgerError):
 
 
 def _write_all(fd, data) -> None:
-    """Write every byte, tolerating a short write from the kernel."""
+    """Write every byte, tolerating a short write from the kernel.
+
+    A write that reports no progress ends the loop rather than spinning on
+    it. Retrying forever would turn a stuck descriptor into a hang, which
+    is a worse failure than an error: the caller can act on an exception,
+    and the append path turns it into a poisoned handle.
+    """
     written = 0
     while written < len(data):
-        written += os.write(fd, data[written:])
+        sent = os.write(fd, data[written:])
+        if sent <= 0:
+            raise OSError(
+                f"write made no progress with {len(data) - written} "
+                f"bytes remaining"
+            )
+        written += sent
 
 
 def _remove_quietly(path) -> None:
@@ -989,10 +1001,22 @@ class Ledger:
 
         # Past this line the new file is the authoritative log. The rename
         # itself is a directory operation, so fsyncing the file would not
-        # persist it; the directory must be fsynced instead. If this fails
-        # the store is still coherent - the path names one complete log or
-        # the other - but the rename may not survive a power cut.
-        _fsync_directory(self._path)
+        # persist it; the directory must be fsynced instead.
+        try:
+            _fsync_directory(self._path)
+        except OSError as error:
+            # The replace already happened, so the compacted log is in place
+            # and reopening will find it. But this handle still holds a
+            # descriptor on the old inode, which os.replace has now unlinked:
+            # anything written through it would land in a file nothing can
+            # ever read again, while the index reported success. Poison the
+            # handle rather than let it continue.
+            self._poisoned = error
+            raise WriteError(
+                f"{self._path}: the log was replaced but the directory fsync "
+                f"failed ({error}); the compacted log is authoritative and "
+                f"reopening will see it, but this handle is no longer usable"
+            ) from error
 
         try:
             old_fd = self._fd
@@ -1254,9 +1278,17 @@ def _cmd_delete(args):
 
 
 def _cmd_scan(args):
+    """Print one line per key, as two tab-separated JSON documents.
+
+    The key is emitted as JSON rather than raw, because a raw key
+    containing a tab would be indistinguishable from the separator, and one
+    containing a newline would silently become two output lines. Quoting it
+    keeps the format lossless for every key the store accepts, and keeps
+    each line parseable by splitting once on the tab.
+    """
     with Ledger.open(args.file, mode=MODE_READ) as db:
         for key, value in db.scan(prefix=args.prefix):
-            print(f"{key}\t{_dump(value)}")
+            print(f"{_dump(key)}\t{_dump(value)}")
     return EXIT_OK
 
 

@@ -177,14 +177,15 @@ class TestScan(CliTestCase):
     def test_scan_is_sorted_and_tab_separated(self):
         self.seed(self.ENTRIES)
         lines = self.ok("scan", self.path).stdout.splitlines()
-        keys = [line.split("\t", 1)[0] for line in lines]
+        keys = [json.loads(line.split("\t", 1)[0]) for line in lines]
         self.assertEqual(keys, sorted(self.ENTRIES))
         self.assertEqual(keys, ["session:a", "user:1", "user:10", "user:2", "zz"])
 
     def test_scan_values_are_valid_json(self):
         self.seed(self.ENTRIES)
         for line in self.ok("scan", self.path).stdout.splitlines():
-            key, _, raw = line.partition("\t")
+            raw_key, _, raw = line.partition("\t")
+            key = json.loads(raw_key)
             with self.subTest(key=key):
                 self.assertEqual(json.loads(raw), self.ENTRIES[key])
 
@@ -192,7 +193,7 @@ class TestScan(CliTestCase):
         self.seed(self.ENTRIES)
         lines = self.ok("scan", self.path, "--prefix", "user:").stdout.splitlines()
         self.assertEqual(
-            [line.split("\t", 1)[0] for line in lines],
+            [json.loads(line.split("\t", 1)[0]) for line in lines],
             ["user:1", "user:10", "user:2"],
         )
 
@@ -206,12 +207,31 @@ class TestScan(CliTestCase):
         self.seed(self.ENTRIES)
         self.ok("delete", self.path, "zz")
         stdout = self.ok("scan", self.path).stdout
-        self.assertNotIn("zz\t", stdout)
+        self.assertNotIn('"zz"\t', stdout)
 
     def test_scan_handles_unicode(self):
         self.ok("put", self.path, "ключ", '"значение"')
         stdout = self.ok("scan", self.path).stdout
         self.assertIn("ключ", stdout)
+
+    def test_scan_output_is_lossless_for_awkward_keys(self):
+        """A raw key containing a tab would be indistinguishable from the
+        separator, and one containing a newline would silently become two
+        output lines. Both columns are JSON, so neither can happen."""
+        awkward = ["plain", "has\ttab", "has\nnewline", 'quote"inside',
+                   "back\\slash", "ключ", "trailing "]
+        for key in awkward:
+            self.ok("put", self.path, key, '"v"')
+        lines = self.ok("scan", self.path).stdout.splitlines()
+        self.assertEqual(
+            len(lines), len(awkward), "one line per key, whatever it contains"
+        )
+        recovered = []
+        for line in lines:
+            raw_key, _, raw_value = line.partition("\t")
+            recovered.append(json.loads(raw_key))
+            self.assertEqual(json.loads(raw_value), "v")
+        self.assertEqual(sorted(recovered), sorted(awkward))
 
 
 class TestExitCodes(CliTestCase):
@@ -529,7 +549,8 @@ class TestCompact(CliTestCase):
     def state(self):
         lines = self.ok("scan", self.path).stdout.splitlines()
         return {
-            line.partition("\t")[0]: json.loads(line.partition("\t")[2])
+            json.loads(line.partition("\t")[0]):
+                json.loads(line.partition("\t")[2])
             for line in lines
         }
 

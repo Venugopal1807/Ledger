@@ -791,8 +791,13 @@ ledger compact FILE
 - `get` prints the value as one line of JSON on stdout, so output is
   unambiguous and pipeable. A missing key is a usage error, distinguished
   from a stored `null` by a sentinel rather than by the API default.
-- `scan` prints `key<TAB>json_value` per line, sorted by key, optionally
-  filtered by `--prefix`. No `--json` mode, no table renderer, no colour.
+- `scan` prints `json_key<TAB>json_value` per line, sorted by key, optionally
+  filtered by `--prefix`. The key is emitted as JSON rather than raw: a raw
+  key containing a tab would be indistinguishable from the separator, and one
+  containing a newline would silently become two output lines. Quoting keeps
+  the format lossless for every key the store accepts, and each line stays
+  parseable by splitting once on the tab. No `--json` mode, no table renderer,
+  no colour.
 - **`get` and `scan` open read-only**; they take no writer lock and never
   modify the file, so a query cannot be blocked by a running application or
   quietly repair something behind the operator's back. `put`, `delete` and
@@ -1165,7 +1170,7 @@ machine, at any time, in any directory.
 One documented build command, pure standard library:
 
 ```
-python3 tools/build.py          # -> dist/ledger.pyz + dist/SHA256SUMS
+python3 tools/build.py          # -> dist/ledger.pyz
 ```
 
 The artifact is a zipapp: a zip archive of the sources with a `#!` shebang
@@ -1195,8 +1200,9 @@ python3 tools/build.py --verify   # builds twice into separate temp dirs,
                                   # compares SHA-256, exits non-zero on mismatch
 ```
 
-The expected digest is committed in `dist/SHA256SUMS` and printed in the
-README, so a judge can run the build and compare against a published hash. A
+The expected digest is published in the README, so a judge can run the build
+and compare against it. No digest file is committed: a checked-in hash has to
+be regenerated on every source change, and a stale one is worse than none. A
 test in the suite runs the double-build comparison, making non-reproducibility
 a test failure rather than a claim.
 

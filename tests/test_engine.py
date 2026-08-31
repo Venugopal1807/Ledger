@@ -404,6 +404,36 @@ class TestWriteFailureAndPoisoning(EngineTestCase):
         successor.put("after", 2)
         self.assertEqual(successor.get("good"), 1)
 
+    def test_zero_progress_write_raises_instead_of_hanging(self):
+        """A write reporting no progress must end the loop, not spin on it.
+
+        Retrying forever would turn a stuck descriptor into a hang, which is
+        strictly worse than an error: the caller can act on an exception.
+        The counter here fails the test rather than letting it run forever.
+        """
+        db = self.open()
+        db.put("good", 1)
+        real_write = os.write
+        attempts = {"count": 0}
+
+        def no_progress(fd, data):
+            if fd == db._fd:
+                attempts["count"] += 1
+                if attempts["count"] > 1000:
+                    raise AssertionError("write loop did not terminate")
+                return 0
+            return real_write(fd, data)
+
+        os.write = no_progress
+        self.addCleanup(lambda: setattr(os, "write", real_write))
+        with self.assertRaises(ledger.WriteError):
+            db.put("stuck", 2)
+        os.write = real_write
+
+        self.assertLess(attempts["count"], 10, "the loop retried too often")
+        self.assertIsNotNone(db._poisoned, "a failed write must poison")
+        self.assertEqual(self.replay_index(), {"good": 1})
+
     def test_failed_delete_does_not_remove_from_the_index(self):
         db = self.open()
         db.put("k", 1)

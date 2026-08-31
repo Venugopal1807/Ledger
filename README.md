@@ -67,8 +67,10 @@ python3 -m ledger inspect state.ledger
 python3 -m ledger compact state.ledger
 ```
 
-`VALUE` is JSON. Reads (`get`, `scan`, `inspect`) open read-only and take no
-lock, so they never block on a running application.
+`VALUE` is JSON. `scan` prints one line per key as two tab-separated JSON
+documents — the key is quoted too, so a key containing a tab or a newline
+cannot corrupt the output. Reads (`get`, `scan`, `inspect`) open read-only and
+take no lock, so they never block on a running application.
 
 As a library:
 
@@ -199,14 +201,14 @@ python3 tools/build.py --verify
 ```
 
 ```
-build 1: dbc5b0dac7b7314d8eec9da8f247f0d7d8bd3bbf3b9a130fefaca8d74454925e  (14973 bytes)
-build 2: dbc5b0dac7b7314d8eec9da8f247f0d7d8bd3bbf3b9a130fefaca8d74454925e  (14973 bytes)
+build 1: c8ae823ba7acfe2813d9ff59f8fc0d54db0f63378e0d4332eec401e4a2cf96d7  (15453 bytes)
+build 2: c8ae823ba7acfe2813d9ff59f8fc0d54db0f63378e0d4332eec401e4a2cf96d7  (15453 bytes)
 reproducible: identical bytes
 ```
 
-**`dist/ledger.pyz` — 14,973 bytes**
+**`dist/ledger.pyz` — 15,453 bytes**
 
-**SHA-256: `dbc5b0dac7b7314d8eec9da8f247f0d7d8bd3bbf3b9a130fefaca8d74454925e`**
+**SHA-256: `c8ae823ba7acfe2813d9ff59f8fc0d54db0f63378e0d4332eec401e4a2cf96d7`**
 
 Verified identical when built by CPython 3.10, 3.11, 3.12 and 3.13, from
 different directories, and under different umasks. Member order, timestamps,
@@ -223,7 +225,7 @@ permissions, `create_system` and compression level are all pinned explicitly;
 | Bit corruption | Every single-bit flip across bounded fixtures, expectations from an independent oracle |
 | Seeded corruption | Multi-bit, byte substitution, range damage, truncation+corruption — seed `20260828` |
 | Total hostile inputs | **12,734** recovery sub-cases |
-| Mutation testing | 12 defects injected into the recovery reader; **12/12 killed** |
+| Mutation testing | 12 defects injected into the recovery reader during development; all 12 were caught by the suite. The mutants were scratch edits and no harness ships, so this one is a development note rather than something the repository reproduces. |
 | Crash recovery | Real subprocesses, real `SIGKILL`, pipe handshake — no sleeps, no timing |
 | Compaction crashes | Nine named interruption points around the state machine |
 | Cross-version | CPython 3.10, 3.11, 3.12, 3.13, plus `-O` |

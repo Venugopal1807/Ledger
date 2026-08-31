@@ -224,8 +224,17 @@ class TestArtifactContents(BuildTestCase):
             if not needle:
                 continue
             with self.subTest(needle=needle):
-                self.assertNotIn(needle, raw, "leaked into the archive bytes")
+                # The member contents are what actually ship, so every needle
+                # is checked there. The compressed stream is only checked for
+                # needles long enough to be meaningful: a short hostname or
+                # login name (this machine's is two characters) appears inside
+                # DEFLATE output by chance, which would make this test pass or
+                # fail on the entropy of the archive rather than on a leak.
                 self.assertNotIn(needle, decompressed, "leaked into a member")
+                if len(needle) >= 6:
+                    self.assertNotIn(
+                        needle, raw, "leaked into the archive bytes"
+                    )
 
     def test_bundled_source_matches_the_repository(self):
         with self.zip_of(self.build()) as archive:
@@ -312,7 +321,7 @@ class TestStandaloneExecution(BuildTestCase):
         self.assertIn("status:  compacted", compacted.stdout)
 
         after = self.run_artifact("scan", self.store)
-        self.assertEqual(after.stdout.strip(), 'user:42\t{"name":"V2"}')
+        self.assertEqual(after.stdout.strip(), '"user:42"\t{"name":"V2"}')
 
     def test_runs_under_isolated_interpreter_flags(self):
         put = self.run_artifact(
