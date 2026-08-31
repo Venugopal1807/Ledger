@@ -321,7 +321,7 @@ class TestStandaloneExecution(BuildTestCase):
         self.assertIn("status:  compacted", compacted.stdout)
 
         after = self.run_artifact("scan", self.store)
-        self.assertEqual(after.stdout.strip(), 'user:42\t{"name":"V2"}')
+        self.assertEqual(after.stdout.strip(), '"user:42"\t{"name":"V2"}')
 
     def test_runs_under_isolated_interpreter_flags(self):
         put = self.run_artifact(
