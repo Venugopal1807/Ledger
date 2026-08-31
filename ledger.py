@@ -611,10 +611,22 @@ class WriteError(LedgerError):
 
 
 def _write_all(fd, data) -> None:
-    """Write every byte, tolerating a short write from the kernel."""
+    """Write every byte, tolerating a short write from the kernel.
+
+    A write that reports no progress ends the loop rather than spinning on
+    it. Retrying forever would turn a stuck descriptor into a hang, which
+    is a worse failure than an error: the caller can act on an exception,
+    and the append path turns it into a poisoned handle.
+    """
     written = 0
     while written < len(data):
-        written += os.write(fd, data[written:])
+        sent = os.write(fd, data[written:])
+        if sent <= 0:
+            raise OSError(
+                f"write made no progress with {len(data) - written} "
+                f"bytes remaining"
+            )
+        written += sent
 
 
 def _remove_quietly(path) -> None:
