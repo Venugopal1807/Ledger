@@ -225,7 +225,7 @@ permissions, `create_system` and compression level are all pinned explicitly;
 | Bit corruption | Every single-bit flip across bounded fixtures, expectations from an independent oracle |
 | Seeded corruption | Multi-bit, byte substitution, range damage, truncation+corruption — seed `20260828` |
 | Total hostile inputs | **12,734** recovery sub-cases |
-| Mutation testing | 12 defects injected into the recovery reader; **12/12 killed** |
+| Mutation testing | 12 defects injected into the recovery reader during development; all 12 were caught by the suite. The mutants were scratch edits and no harness ships, so this one is a development note rather than something the repository reproduces. |
 | Crash recovery | Real subprocesses, real `SIGKILL`, pipe handshake — no sleeps, no timing |
 | Compaction crashes | Nine named interruption points around the state machine |
 | Cross-version | CPython 3.10, 3.11, 3.12, 3.13, plus `-O` |
