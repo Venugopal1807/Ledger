@@ -67,8 +67,10 @@ python3 -m ledger inspect state.ledger
 python3 -m ledger compact state.ledger
 ```
 
-`VALUE` is JSON. Reads (`get`, `scan`, `inspect`) open read-only and take no
-lock, so they never block on a running application.
+`VALUE` is JSON. `scan` prints one line per key as two tab-separated JSON
+documents — the key is quoted too, so a key containing a tab or a newline
+cannot corrupt the output. Reads (`get`, `scan`, `inspect`) open read-only and
+take no lock, so they never block on a running application.
 
 As a library:
 

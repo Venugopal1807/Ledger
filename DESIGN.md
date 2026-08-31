@@ -791,8 +791,13 @@ ledger compact FILE
 - `get` prints the value as one line of JSON on stdout, so output is
   unambiguous and pipeable. A missing key is a usage error, distinguished
   from a stored `null` by a sentinel rather than by the API default.
-- `scan` prints `key<TAB>json_value` per line, sorted by key, optionally
-  filtered by `--prefix`. No `--json` mode, no table renderer, no colour.
+- `scan` prints `json_key<TAB>json_value` per line, sorted by key, optionally
+  filtered by `--prefix`. The key is emitted as JSON rather than raw: a raw
+  key containing a tab would be indistinguishable from the separator, and one
+  containing a newline would silently become two output lines. Quoting keeps
+  the format lossless for every key the store accepts, and each line stays
+  parseable by splitting once on the tab. No `--json` mode, no table renderer,
+  no colour.
 - **`get` and `scan` open read-only**; they take no writer lock and never
   modify the file, so a query cannot be blocked by a running application or
   quietly repair something behind the operator's back. `put`, `delete` and

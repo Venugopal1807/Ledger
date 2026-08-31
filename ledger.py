@@ -1266,9 +1266,17 @@ def _cmd_delete(args):
 
 
 def _cmd_scan(args):
+    """Print one line per key, as two tab-separated JSON documents.
+
+    The key is emitted as JSON rather than raw, because a raw key
+    containing a tab would be indistinguishable from the separator, and one
+    containing a newline would silently become two output lines. Quoting it
+    keeps the format lossless for every key the store accepts, and keeps
+    each line parseable by splitting once on the tab.
+    """
     with Ledger.open(args.file, mode=MODE_READ) as db:
         for key, value in db.scan(prefix=args.prefix):
-            print(f"{key}\t{_dump(value)}")
+            print(f"{_dump(key)}\t{_dump(value)}")
     return EXIT_OK
 
 
