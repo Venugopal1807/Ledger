@@ -217,7 +217,7 @@ permissions, `create_system` and compression level are all pinned explicitly;
 
 ## Testing
 
-365 tests, but the count is not the point — what was tested is:
+369 tests, but the count is not the point — what was tested is:
 
 | Area | What was done |
 | --- | --- |
